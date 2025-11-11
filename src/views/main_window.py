@@ -9,17 +9,27 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-try:
-    import qdarktheme
-except ImportError:  # pragma: no cover - fallback for unsupported Python versions
-    class _QDarkThemeFallback:
-        @staticmethod
-        def setup_theme(theme_name: str):
-            logging.getLogger(__name__).warning(
-                "qdarktheme is not available; skipping theme setup for '%s'.", theme_name
-            )
+def _load_theme_module():
+    try:
+        import qdarktheme as theme_module  # type: ignore
+        return theme_module
+    except ImportError:
+        try:
+            import pyqtdarktheme as theme_module  # type: ignore
+            return theme_module
+        except ImportError:
+            class _Fallback:
+                @staticmethod
+                def setup_theme(theme_name: str):
+                    logging.getLogger(__name__).warning(
+                        "No dark theme package available; skipping theme setup for '%s'.",
+                        theme_name,
+                    )
 
-    qdarktheme = _QDarkThemeFallback()
+            return _Fallback()
+
+
+qdarktheme = _load_theme_module()
 
 try:
     from PySide6 import QtConcurrent

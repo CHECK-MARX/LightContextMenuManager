@@ -132,7 +132,8 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
 
     def set_keyword(self, keyword: str):
         self._keyword = keyword.strip()
-        self.invalidateFilter()
+        # invalidate() supersedes invalidateFilter() in Qt6
+        self.invalidate()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # type: ignore[override]
         if not self._keyword:
