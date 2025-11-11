@@ -1,0 +1,11 @@
+﻿{
+  "id": "developer",
+  "label": "Developer",
+  "description": "開発者向けに各種ツールを有効化",
+  "rules": [
+    {"name_contains": "Git", "enable": true},
+    {"name_contains": "VS Code", "enable": true},
+    {"name_contains": "7-Zip", "enable": true},
+    {"name_contains": "Send to", "enable": false}
+  ]
+}

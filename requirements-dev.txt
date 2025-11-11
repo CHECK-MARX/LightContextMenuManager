@@ -1,0 +1,4 @@
+﻿-r requirements.txt
+pytest>=7.0
+pytest-qt>=4.4
+pytest-cov>=4.1

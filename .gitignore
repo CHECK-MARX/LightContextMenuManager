@@ -1,0 +1,7 @@
+dist/
+build/
+*.spec
+.pytest_cache/
+__pycache__/
+.venv/
+audit/

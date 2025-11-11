@@ -1,0 +1,10 @@
+﻿{
+  "id": "minimal",
+  "label": "Minimal",
+  "description": "家庭用の最小限のメニュー構成",
+  "rules": [
+    {"name_contains": "OneDrive", "scope": "*", "enable": false},
+    {"name_contains": "Git", "scope": "*", "enable": false},
+    {"name_contains": "PowerShell", "scope": "Folder", "enable": true}
+  ]
+}
