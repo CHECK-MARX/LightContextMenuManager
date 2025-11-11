@@ -10,7 +10,7 @@ Windows 11 の右クリックメニューを Python 3.11 + PySide6 で整理す�
    ```
 2. 管理者権限でアプリを起動します (初回起動時に UAC 昇格を自動要求)。
    ```powershell
-   python -m src.main
+   python app.py
    ```
 
 ## 主な機能
