@@ -9,7 +9,7 @@ import re
 import subprocess
 from ctypes import wintypes
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
 
@@ -960,11 +960,12 @@ def audit_append(
         appdata = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
         audit_dir = appdata / "LightContextMenuManager" / "audit"
         audit_dir.mkdir(parents=True, exist_ok=True)
-        filename = audit_dir / f"audit_{datetime.utcnow():%Y%m%d}.csv"
+        now = datetime.now(timezone.utc)
+        filename = audit_dir / f"audit_{now:%Y%m%d}.csv"
         user = os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
         machine = platform.node()
         row = [
-            datetime.utcnow().isoformat(timespec="seconds"),
+            now.isoformat(timespec="seconds"),
             user,
             machine,
             action,

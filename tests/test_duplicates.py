@@ -1,6 +1,6 @@
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -86,7 +86,7 @@ def test_audit_append(tmp_path, monkeypatch):
     entry.full_key_path = f"{HKCR_PREFIX}{entry.registry_path}"
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     audit_append("duplicate_quarantine", entry, "src", "dst", True)
-    today = datetime.utcnow().strftime("%Y%m%d")
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
     audit_file = tmp_path / "LightContextMenuManager" / "audit" / f"audit_{today}.csv"
     assert audit_file.exists()
     content = audit_file.read_text(encoding="utf-8-sig")
