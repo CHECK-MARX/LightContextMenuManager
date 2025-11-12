@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QSortFilterProxyModel
+from PySide6.QtGui import QIcon
 
 
 @dataclass
@@ -20,6 +21,9 @@ class HandlerEntry:
     last_modified: Optional[datetime]
     status: str
     read_only: bool = False
+    icon: Optional[QIcon] = None
+    target_path: Optional[str] = None
+    tooltip: str = ""
 
     def to_csv_row(self) -> List[str]:
         timestamp = self.last_modified.isoformat(sep=" ") if self.last_modified else ""
@@ -76,6 +80,10 @@ class HandlerTableModel(QAbstractTableModel):
                 if entry.last_modified:
                     return entry.last_modified.strftime("%Y-%m-%d %H:%M:%S")
                 return ""
+        elif role == Qt.DecorationRole and column == 1:
+            return entry.icon
+        elif role == Qt.ToolTipRole:
+            return entry.tooltip
         elif role == Qt.CheckStateRole and column == 0:
             return Qt.Checked if entry.enabled else Qt.Unchecked
         elif role == Qt.TextAlignmentRole and column in (2, 3, 4, 5, 6):
@@ -143,5 +151,15 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
         entry = model.entry_at(source_row)
         if not entry:
             return False
-        haystack = "|".join([entry.name, entry.key_name, entry.scope, entry.registry_path, entry.base_path, entry.status])
+        haystack = "|".join(
+            [
+                entry.name,
+                entry.key_name,
+                entry.scope,
+                entry.registry_path,
+                entry.base_path,
+                entry.status,
+                entry.target_path or "",
+            ]
+        )
         return self._keyword.lower() in haystack.lower()

@@ -59,6 +59,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QComboBox,
+    QMenu,
+    QApplication,
 )
 
 from ..audit import AuditLogger
@@ -116,6 +118,8 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.setSortingEnabled(True)
         self.table.clicked.connect(self._handle_table_click)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -237,6 +241,18 @@ class MainWindow(QMainWindow):
             return
         desired_state = not entry.enabled
         self._toggle_entry(entry, desired_state, record_history=True)
+
+    def _show_context_menu(self, pos):
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        entry = self.model.entry_at(self.proxy.mapToSource(index).row())
+        if not entry:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("レジストリを開く")
+        open_action.triggered.connect(lambda _, e=entry: self._open_registry_entry(e))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _toggle_entry(self, entry: HandlerEntry, desired_state: bool, record_history: bool):
         entry_copy = replace(entry)
@@ -488,6 +504,22 @@ class MainWindow(QMainWindow):
     def restart_explorer(self):
         self.registry.restart_explorer()
         QMessageBox.information(self, "Explorer", "Explorer を再起動しました。")
+
+    def _open_registry_entry(self, entry: HandlerEntry):
+        key_path = f"HKEY_CLASSES_ROOT\\{entry.registry_path}"
+        clipboard = QApplication.clipboard()
+        clipboard.setText(key_path)
+        try:
+            subprocess.Popen(["regedit.exe", "/m", key_path])
+        except Exception as exc:
+            self.logger.debug("Failed to open regedit for %s: %s", key_path, exc)
+            QMessageBox.information(self, "レジストリ", f"キーをクリップボードにコピーしました。\n{key_path}")
+        else:
+            QMessageBox.information(
+                self,
+                "レジストリ",
+                f"regedit を開きました。キーはクリップボードにコピー済みです。\n{key_path}",
+            )
 
     def open_audit_folder(self):
         try:
