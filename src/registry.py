@@ -651,7 +651,7 @@ def _ensure_full_key_path(path: str) -> str:
     normalized = path.strip()
     if normalized.startswith(HKCR_PREFIX):
         return normalized
-    return f"{HKCR_PREFIX}{normalized.lstrip('\\')}"
+    return f"{HKCR_PREFIX}{normalized.lstrip('\\\\')}"
 
 
 def _strip_full_key_path(path: str) -> str:
