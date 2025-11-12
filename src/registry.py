@@ -22,11 +22,7 @@ shell32 = ctypes.windll.shell32
 user32 = ctypes.windll.user32
 shlwapi = ctypes.windll.shlwapi
 
-LCM_QUARANTINE_SEG = "DisabledHandlers\\LcmQuarantine"
-LCM_ORIGINAL_PATH = "LCM_OriginalPath"
-LCM_TIMESTAMP = "LCM_Timestamp"
-LCM_VERSION = "LCM_Version"
-
+HKCR_PREFIX = "HKEY_CLASSES_ROOT\\"
 LCM_QUARANTINE_SEG = "DisabledHandlers\\LcmQuarantine"
 LCM_ORIGINAL_PATH = "LCM_OriginalPath"
 LCM_TIMESTAMP = "LCM_Timestamp"
@@ -619,34 +615,80 @@ def group_duplicates(handlers: List[HandlerEntry]) -> List[DuplicateGroup]:
             buckets.setdefault(key, []).append(entry)
         for key, entries in buckets.items():
             _group(key, entries, reason)
-        return groups
+    return groups
+
+
+def _lookup_registry_value(key_path: str, name: str) -> Optional[str]:
+    try:
+        hive, sub = key_path.split("\\", 1)
+        root = getattr(winreg, hive)
+        with winreg.OpenKey(root, sub, 0, READ_FLAGS) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            if isinstance(value, bytes):
+                return value.decode("utf-16", errors="ignore")
+            return str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to read value %s from %s", name, key_path, exc_info=True)
+        return None
+
+
+def _registry_key_exists(key_path: str) -> bool:
+    try:
+        hive, sub = key_path.split("\\", 1)
+        root = getattr(winreg, hive)
+        with winreg.OpenKey(root, sub, 0, READ_FLAGS):
+            return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to check key %s", key_path, exc_info=True)
+        return False
+
+
+def _ensure_full_key_path(path: str) -> str:
+    if not path:
+        return ""
+    normalized = path.strip()
+    if normalized.startswith(HKCR_PREFIX):
+        return normalized
+    return f"{HKCR_PREFIX}{normalized.lstrip('\\')}"
+
+
+def _strip_full_key_path(path: str) -> str:
+    if path.startswith(HKCR_PREFIX):
+        return path[len(HKCR_PREFIX) :]
+    return path
 
 
 def is_quarantined(entry: HandlerEntry) -> bool:
-    path = entry.full_key_path or ""
-    if not path:
+    candidate = entry.full_key_path or entry.registry_path or ""
+    if not candidate:
         return False
-    if LCM_QUARANTINE_SEG in path:
+    full_path = _ensure_full_key_path(candidate)
+    if LCM_QUARANTINE_SEG in full_path:
         return True
-    temp = RegistryManager()
-    value = temp._read_registry_value(path, LCM_ORIGINAL_PATH)
-    return bool(value)
+    return bool(_lookup_registry_value(full_path, LCM_ORIGINAL_PATH))
 
 
-def restore_quarantined(entry: HandlerEntry, registry: RegistryManager) -> str:
-    path = entry.full_key_path
-    if not path or LCM_QUARANTINE_SEG not in path:
+def restore_quarantined(entry: HandlerEntry) -> str:
+    full_path = _ensure_full_key_path(entry.full_key_path or entry.registry_path or "")
+    if not full_path or LCM_QUARANTINE_SEG not in full_path:
         raise RegistryOperationError("Entry is not quarantined")
-    original = registry._read_registry_value(path, LCM_ORIGINAL_PATH)
+    original = _lookup_registry_value(full_path, LCM_ORIGINAL_PATH)
     if not original:
         raise RegistryOperationError("Missing original path metadata")
     dest = original
     suffix = 1
-    while registry._key_exists(dest):
+    while True:
+        candidate = _ensure_full_key_path(dest)
+        if not _registry_key_exists(candidate):
+            break
         suffix += 1
         dest = f"{original}-{suffix}"
-    registry.move_key(path, dest)
-    return dest
+    source = _strip_full_key_path(full_path)
+    manager = RegistryManager()
+    manager.move_key(source, dest)
+    return _ensure_full_key_path(dest)
 
     def _copy_tree(self, source_path: str, destination_path: str):
         try:
