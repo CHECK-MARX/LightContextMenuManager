@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Literal, Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QSortFilterProxyModel
 from PySide6.QtGui import QIcon
@@ -13,20 +13,28 @@ class HandlerEntry:
     """Represents a single context menu handler row."""
 
     name: str
-    key_name: str
+    type: Literal["verb", "shellex"]
+    type: Literal["verb", "shellex"]
     scope: str
+    key_name: str
     registry_path: str
+    full_key_path: str
     base_path: str
+    base_rel_path: str
     enabled: bool
     last_modified: Optional[datetime]
+    last_write_time: Optional[datetime]
     status: str
     read_only: bool = False
+    command: Optional[str] = None
+    normalized_name: str = ""
+    normalized_command: Optional[str] = None
     icon: Optional[QIcon] = None
     target_path: Optional[str] = None
     tooltip: str = ""
-    handler_kind: str = "shellex"
-    is_favorite: bool = False
     clsid: Optional[str] = None
+    is_quarantined: bool = False
+    quarantine_meta: Optional[Dict[str, str]] = None
 
     def to_csv_row(self) -> List[str]:
         timestamp = self.last_modified.isoformat(sep=" ") if self.last_modified else ""
@@ -140,7 +148,7 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
         super().__init__()
         self._keyword = ""
         self._favorites_only = False
-        self._handler_kind: Optional[str] = None
+        self._type_filter: Optional[str] = None
         self._scope_filter: Optional[str] = None
         self.setFilterCaseSensitivity(Qt.CaseInsensitive)
 
@@ -153,8 +161,8 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
         self._favorites_only = enabled
         self.invalidate()
 
-    def set_handler_kind(self, handler_kind: Optional[str]):
-        self._handler_kind = handler_kind
+    def set_type_filter(self, handler_type: Optional[str]):
+        self._type_filter = handler_type
         self.invalidate()
 
     def set_scope_filter(self, scope: Optional[str]):
@@ -168,7 +176,7 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
             return False
         if self._favorites_only and not entry.is_favorite:
             return False
-        if self._handler_kind and entry.handler_kind != self._handler_kind:
+        if self._type_filter and entry.type != self._type_filter:
             return False
         if self._scope_filter and entry.scope != self._scope_filter:
             return False

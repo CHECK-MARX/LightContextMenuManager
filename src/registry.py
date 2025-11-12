@@ -4,17 +4,54 @@ import csv
 import ctypes
 import logging
 import os
+import platform
 import re
 import subprocess
 from ctypes import wintypes
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
 
 import winreg
 from PySide6.QtGui import QIcon, QPixmap
 
 from .models import HandlerEntry
+
+shell32 = ctypes.windll.shell32
+user32 = ctypes.windll.user32
+shlwapi = ctypes.windll.shlwapi
+
+LCM_QUARANTINE_SEG = "DisabledHandlers\\LcmQuarantine"
+LCM_ORIGINAL_PATH = "LCM_OriginalPath"
+LCM_TIMESTAMP = "LCM_Timestamp"
+LCM_VERSION = "LCM_Version"
+
+LCM_QUARANTINE_SEG = "DisabledHandlers\\LcmQuarantine"
+LCM_ORIGINAL_PATH = "LCM_OriginalPath"
+LCM_TIMESTAMP = "LCM_Timestamp"
+LCM_VERSION = "LCM_Version"
+
+
+def export_to_reg(paths: Iterable[str], out_dir: Optional[Path] = None) -> Path:
+    assert paths, "paths must contain at least one registry path"
+    out_dir = Path(out_dir) if out_dir else Path.cwd() / "backups"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"LCM_backup_{datetime.utcnow():%Y%m%d_%H%M%S}.reg"
+    header = "Windows Registry Editor Version 5.00\n\n"
+    out_file.write_text(header, encoding="utf-16")
+
+    for key in paths:
+        temp_path = out_dir / f"_tmp_{abs(hash(key))}.reg"
+        subprocess.run(["reg", "export", key, str(temp_path), "/y"], check=True, shell=True)
+        content = temp_path.read_text(encoding="utf-16")
+        body = content.replace("Windows Registry Editor Version 5.00", "", 1).lstrip()
+        with out_file.open("a", encoding="utf-16") as handle:
+            handle.write(body + "\n")
+        if temp_path.exists():
+            temp_path.unlink()
+
+    return out_file
 
 shell32 = ctypes.windll.shell32
 user32 = ctypes.windll.user32
@@ -184,8 +221,16 @@ class RegistryManager:
                 try:
                     *_counts, last_write = winreg.QueryInfoKey(key)
                     timestamp = datetime.fromtimestamp(last_write)
+                    last_write_time = timestamp
                 except OSError:
                     timestamp = None
+                    last_write_time = None
+                command_value = None
+                normalized_command = ""
+                if handler_kind == "shell":
+                    command_value = self._read_command_target(key)
+                    normalized_command = self._normalize_command(command_value)
+                normalized_name = self._normalize_text(display_name)
                 display_name, icon, target_path = self._resolve_display_info(
                     handler_kind=handler_kind,
                     default_value=str(default_value) if default_value else "",
@@ -197,20 +242,27 @@ class RegistryManager:
         status = "read-only" if read_only else ("enabled" if enabled else "disabled")
         return HandlerEntry(
             name=display_name,
+            type="shell" if handler_kind == "shell" else "shellex",
             key_name=key_name,
             scope=scope,
             registry_path=registry_path,
             base_path=base_path,
+            base_rel_path=base_path,
             enabled=True if read_only else enabled,
             last_modified=timestamp,
+            last_write_time=last_write_time,
             status=status,
             read_only=read_only,
             icon=icon,
             target_path=target_path,
             tooltip=self._format_tooltip(target_path, registry_path, status),
-            handler_kind=handler_kind,
             clsid=clsid_value,
-        )
+            command=command_value,
+            normalized_name=normalized_name,
+            normalized_command=normalized_command,
+            full_key_path=f"HKEY_CLASSES_ROOT\\{registry_path}",
+            is_quarantined="LcmQuarantine" in registry_path,
+            )
 
     # ------------------------------------------------------------------ #
     # Metadata helpers
@@ -439,6 +491,21 @@ class RegistryManager:
         full_key = f"HKEY_CLASSES_ROOT\\{registry_path}"
         return f"実体: {target}\nキー: {full_key}\n状態: {status}"
 
+    def _normalize_text(self, value: str) -> str:
+        return re.sub(r"\s+", " ", value or "").strip().lower()
+
+    def _normalize_command(self, command: Optional[str]) -> str:
+        if not command:
+            return ""
+        cleaned = command.replace('"', "").replace("'", "").strip().lower()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        parts = cleaned.split(" ")
+        if not parts:
+            return ""
+        base = parts[0]
+        args = " ".join(parts[1:])
+        return f"{base} {args}".strip()
+
     def clsid_registry_path(self, entry: HandlerEntry) -> Optional[str]:
         clsid = entry.clsid
         if not clsid:
@@ -478,6 +545,108 @@ class RegistryManager:
         self._delete_tree(destination_path)
         self._copy_tree(source_path, destination_path)
         self._delete_tree(source_path)
+
+    def move_key(self, source_path: str, destination_path: str):
+        """Public helper for quarantine operations that wraps _move_tree."""
+        self.logger.info("Quarantining %s -> %s", source_path, destination_path)
+        self._move_tree(source_path, destination_path)
+
+    def _quarantine_destination(self, entry: HandlerEntry) -> str:
+        return f"{entry.base_rel_path}\\DisabledHandlers\\LcmQuarantine\\{entry.key_name}"
+
+    def quarantine_key(self, entry: HandlerEntry) -> str:
+        dest_rel = self._quarantine_destination(entry)
+        self.move_key(entry.registry_path, dest_rel)
+        with winreg.OpenKey(HKCR, dest_rel, 0, WRITE_FLAGS) as key:
+            winreg.SetValueEx(key, "LCM_OriginalPath", 0, winreg.REG_SZ, entry.registry_path)
+            winreg.SetValueEx(key, "LCM_Timestamp", 0, winreg.REG_SZ, datetime.utcnow().isoformat())
+            winreg.SetValueEx(key, "LCM_Version", 0, winreg.REG_SZ, "1")
+        entry.is_quarantined = True
+        entry.quarantine_meta = {
+            "original": entry.registry_path,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        entry.registry_path = dest_rel
+        return dest_rel
+
+
+@dataclass
+class DuplicateGroup:
+    reason: Literal["name", "command"]
+    key: str
+    entries: List[HandlerEntry]
+    suggested_keep_index: int
+
+
+def group_duplicates(handlers: List[HandlerEntry]) -> List[DuplicateGroup]:
+    groups: List[DuplicateGroup] = []
+    seen_keys: Set[Tuple[str, str]] = set()
+
+    def _select_keep(entries: List[HandlerEntry]) -> int:
+        sorted_list = sorted(
+            enumerate(entries),
+            key=lambda pair: (pair[1].last_write_time or datetime.min),
+            reverse=True,
+        )
+        return sorted_list[0][0]
+
+    def _group(map_key: Tuple[str, str], entries: List[HandlerEntry], reason: str):
+        if len(entries) < 2:
+            return
+        if (reason, map_key) in seen_keys:
+            return
+        seen_keys.add((reason, map_key))
+        keep_index = _select_keep(entries)
+        group_key = "|".join(map_key)
+        groups.append(
+            DuplicateGroup(
+                reason=reason,
+                key=group_key,
+                entries=entries,
+                suggested_keep_index=keep_index,
+            )
+        )
+
+    for reason, key_extractor in [
+        ("name", lambda e: (e.scope, e.type, e.normalized_name)),
+        ("command", lambda e: (e.scope, e.type, e.normalized_command or "")),
+    ]:
+        buckets: Dict[Tuple[str, str, str], List[HandlerEntry]] = {}
+        for entry in handlers:
+            key = key_extractor(entry)
+            if not key[2]:
+                continue
+            buckets.setdefault(key, []).append(entry)
+        for key, entries in buckets.items():
+            _group(key, entries, reason)
+        return groups
+
+
+def is_quarantined(entry: HandlerEntry) -> bool:
+    path = entry.full_key_path or ""
+    if not path:
+        return False
+    if LCM_QUARANTINE_SEG in path:
+        return True
+    temp = RegistryManager()
+    value = temp._read_registry_value(path, LCM_ORIGINAL_PATH)
+    return bool(value)
+
+
+def restore_quarantined(entry: HandlerEntry, registry: RegistryManager) -> str:
+    path = entry.full_key_path
+    if not path or LCM_QUARANTINE_SEG not in path:
+        raise RegistryOperationError("Entry is not quarantined")
+    original = registry._read_registry_value(path, LCM_ORIGINAL_PATH)
+    if not original:
+        raise RegistryOperationError("Missing original path metadata")
+    dest = original
+    suffix = 1
+    while registry._key_exists(dest):
+        suffix += 1
+        dest = f"{original}-{suffix}"
+    registry.move_key(path, dest)
+    return dest
 
     def _copy_tree(self, source_path: str, destination_path: str):
         try:
@@ -664,6 +833,129 @@ class RegistryManager:
             writer.writerow(["名前", "スコープ", "状態", "レジストリパス", "最終変更日時"])
             writer.writerows(rows)
         return len(rows)
+
+    def _read_registry_value(self, key_path: str, name: str) -> Optional[str]:
+        try:
+            hive, sub = key_path.split("\\", 1)
+            root = getattr(winreg, hive)
+            with winreg.OpenKey(root, sub, 0, READ_FLAGS) as key:
+                value, _ = winreg.QueryValueEx(key, name)
+                if isinstance(value, bytes):
+                    return value.decode("utf-16", errors="ignore")
+                return str(value)
+        except Exception:
+            self.logger.debug("Failed to read value %s from %s", name, key_path, exc_info=True)
+            return None
+
+    def _key_exists(self, key_path: str) -> bool:
+        try:
+            hive, sub = key_path.split("\\", 1)
+            root = getattr(winreg, hive)
+            with winreg.OpenKey(root, sub, 0, READ_FLAGS):
+                return True
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+
+    def _read_registry_value(self, key_path: str, name: str) -> Optional[str]:
+        try:
+            hive, sub = key_path.split("\\", 1)
+            root = getattr(winreg, hive)
+            with winreg.OpenKey(root, sub, 0, READ_FLAGS) as key:
+                value, _ = winreg.QueryValueEx(key, name)
+                if isinstance(value, bytes):
+                    return value.decode("utf-16", errors="ignore")
+                return str(value)
+        except Exception:
+            self.logger.debug("Failed to read value %s from %s", name, key_path, exc_info=True)
+            return None
+
+    def _key_exists(self, key_path: str) -> bool:
+        try:
+            hive, sub = key_path.split("\\", 1)
+            root = getattr(winreg, hive)
+            with winreg.OpenKey(root, sub, 0, READ_FLAGS):
+                return True
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+
+    def is_quarantined(self, entry: HandlerEntry) -> bool:
+        path = entry.full_key_path
+        if not path:
+            return False
+        if LCM_QUARANTINE_SEG in path:
+            return True
+        value = self._read_registry_value(path, LCM_ORIGINAL_PATH)
+        return bool(value)
+
+    def restore_quarantined(self, entry: HandlerEntry) -> str:
+        path = entry.full_key_path
+        if not path or LCM_QUARANTINE_SEG not in path:
+            raise RegistryOperationError("Entry is not quarantined")
+        original = self._read_registry_value(path, LCM_ORIGINAL_PATH)
+        if not original:
+            raise RegistryOperationError("Missing original path metadata")
+        dest = original
+        suffix = 1
+        while self._key_exists(dest):
+            suffix += 1
+            dest = f"{original}-{suffix}"
+        self.move_key(path, dest)
+        return dest
+
+def audit_append(
+    action: str,
+    entry: HandlerEntry,
+    src: str,
+    dst: str,
+    ok: bool,
+    error: str = "",
+):
+    try:
+        appdata = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        audit_dir = appdata / "LightContextMenuManager" / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        filename = audit_dir / f"audit_{datetime.utcnow():%Y%m%d}.csv"
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
+        machine = platform.node()
+        row = [
+            datetime.utcnow().isoformat(timespec="seconds"),
+            user,
+            machine,
+            action,
+            entry.scope,
+            entry.type,
+            entry.name,
+            src,
+            dst,
+            "OK" if ok else "NG",
+            error,
+        ]
+        exists = filename.exists()
+        with filename.open("a", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\r\n")
+            if not exists:
+                writer.writerow(
+                    [
+                        "timestamp",
+                        "user",
+                        "machine",
+                        "action",
+                        "scope",
+                        "type",
+                        "name",
+                        "src",
+                        "dst",
+                        "result",
+                        "error",
+                    ]
+                )
+            writer.writerow(row)
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to append audit log", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # Shell helper
