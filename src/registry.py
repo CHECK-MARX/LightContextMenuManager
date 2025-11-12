@@ -1,30 +1,99 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import logging
+import os
+import platform
+import re
 import subprocess
-from datetime import datetime
+from ctypes import wintypes
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
 
 import winreg
+from PySide6.QtGui import QIcon, QPixmap
 
 from .models import HandlerEntry
+
+shell32 = ctypes.windll.shell32
+user32 = ctypes.windll.user32
+shlwapi = ctypes.windll.shlwapi
+
+HKCR_PREFIX = "HKEY_CLASSES_ROOT\\"
+LCM_QUARANTINE_SEG = "DisabledHandlers\\LcmQuarantine"
+LCM_ORIGINAL_PATH = "LCM_OriginalPath"
+LCM_TIMESTAMP = "LCM_Timestamp"
+LCM_VERSION = "LCM_Version"
+
+
+def export_to_reg(paths: Iterable[str], out_dir: Optional[Path] = None) -> Path:
+    assert paths, "paths must contain at least one registry path"
+    out_dir = Path(out_dir) if out_dir else Path.cwd() / "backups"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"LCM_backup_{datetime.utcnow():%Y%m%d_%H%M%S}.reg"
+    header = "Windows Registry Editor Version 5.00\n\n"
+    out_file.write_text(header, encoding="utf-16")
+
+    for key in paths:
+        temp_path = out_dir / f"_tmp_{abs(hash(key))}.reg"
+        subprocess.run(["reg", "export", key, str(temp_path), "/y"], check=True, shell=True)
+        content = temp_path.read_text(encoding="utf-16")
+        body = content.replace("Windows Registry Editor Version 5.00", "", 1).lstrip()
+        with out_file.open("a", encoding="utf-16") as handle:
+            handle.write(body + "\n")
+        if temp_path.exists():
+            temp_path.unlink()
+
+    return out_file
+
+shell32 = ctypes.windll.shell32
+user32 = ctypes.windll.user32
+shlwapi = ctypes.windll.shlwapi
+version = ctypes.windll.version
+
+MAX_PATH = 260
+HRESULT = ctypes.c_long
+
+
+class SHFILEINFO(ctypes.Structure):
+    _fields_ = [
+        ("hIcon", wintypes.HICON),
+        ("iIcon", ctypes.c_int),
+        ("dwAttributes", wintypes.DWORD),
+        ("szDisplayName", wintypes.WCHAR * MAX_PATH),
+        ("szTypeName", wintypes.WCHAR * 80),
+    ]
+
+
+SHGFI_ICON = 0x000000100
+SHGFI_SMALLICON = 0x000000001
+SHGFI_USEFILEATTRIBUTES = 0x000000010
+
+shlwapi.SHLoadIndirectString.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.LPWSTR,
+    wintypes.UINT,
+    ctypes.c_void_p,
+]
+shlwapi.SHLoadIndirectString.restype = HRESULT
 
 HKCR = winreg.HKEY_CLASSES_ROOT
 READ_FLAGS = winreg.KEY_READ | winreg.KEY_WOW64_64KEY
 WRITE_FLAGS = winreg.KEY_READ | winreg.KEY_WRITE | winreg.KEY_WOW64_64KEY
 
 SHELLEX_TARGETS = [
-    {"scope": "*", "path": r"*\shellex\ContextMenuHandlers"},
-    {"scope": "Folder", "path": r"Folder\shellex\ContextMenuHandlers"},
-    {"scope": "Directory Background", "path": r"Directory\Background\shellex\ContextMenuHandlers"},
-    {"scope": "Drive", "path": r"Drive\shellex\ContextMenuHandlers"},
+    {"scope": "*", "path": r"*\shellex\ContextMenuHandlers", "kind": "shellex"},
+    {"scope": "Folder", "path": r"Folder\shellex\ContextMenuHandlers", "kind": "shellex"},
+    {"scope": "Directory Background", "path": r"Directory\Background\shellex\ContextMenuHandlers", "kind": "shellex"},
+    {"scope": "Drive", "path": r"Drive\shellex\ContextMenuHandlers", "kind": "shellex"},
 ]
 
 SHELL_TARGETS = [
-    {"scope": "*", "path": r"*\shell"},
-    {"scope": "Folder", "path": r"Folder\shell"},
+    {"scope": "*", "path": r"*\shell", "kind": "shell"},
+    {"scope": "Folder", "path": r"Folder\shell", "kind": "shell"},
 ]
 
 REG_HEADER = "Windows Registry Editor Version 5.00"
@@ -39,6 +108,7 @@ class RegistryManager:
 
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
+        self._icon_cache: Dict[str, QIcon] = {}
 
     # ------------------------------------------------------------------ #
     # Discovery
@@ -54,6 +124,7 @@ class RegistryManager:
     def _read_scope(self, descriptor: dict, read_only: bool) -> List[HandlerEntry]:
         scope = descriptor["scope"]
         base_path = descriptor["path"]
+        kind = descriptor.get("kind", "shellex")
         collected: List[HandlerEntry] = []
         collected.extend(
             self._iterate_entries(
@@ -62,6 +133,7 @@ class RegistryManager:
                 scope=scope,
                 enabled=True,
                 read_only=read_only,
+                handler_kind=kind,
             )
         )
         if not read_only:
@@ -73,6 +145,7 @@ class RegistryManager:
                     scope=scope,
                     enabled=False,
                     read_only=False,
+                    handler_kind=kind,
                 )
             )
         return collected
@@ -85,6 +158,7 @@ class RegistryManager:
         scope: str,
         enabled: bool,
         read_only: bool,
+        handler_kind: str,
     ) -> List[HandlerEntry]:
         entries: List[HandlerEntry] = []
         try:
@@ -104,6 +178,7 @@ class RegistryManager:
                         key_name=key_name,
                         enabled=enabled,
                         read_only=read_only,
+                        handler_kind=handler_kind,
                     )
                     if entry:
                         entries.append(entry)
@@ -120,14 +195,21 @@ class RegistryManager:
         key_name: str,
         enabled: bool,
         read_only: bool,
+        handler_kind: str,
     ) -> Optional[HandlerEntry]:
         try:
             with winreg.OpenKey(HKCR, registry_path, 0, READ_FLAGS) as key:
                 display_name = key_name
+                default_value = ""
+                clsid_value = None
                 try:
                     default_value, _ = winreg.QueryValueEx(key, None)
                     if default_value:
                         display_name = str(default_value)
+                        if handler_kind == "shellex" and isinstance(default_value, str):
+                            stripped = default_value.strip()
+                            if stripped.startswith("{") and stripped.endswith("}"):
+                                clsid_value = stripped
                 except FileNotFoundError:
                     pass
                 except OSError:
@@ -135,22 +217,296 @@ class RegistryManager:
                 try:
                     *_counts, last_write = winreg.QueryInfoKey(key)
                     timestamp = datetime.fromtimestamp(last_write)
+                    last_write_time = timestamp
                 except OSError:
                     timestamp = None
+                    last_write_time = None
+                command_value = None
+                normalized_command = ""
+                if handler_kind == "shell":
+                    command_value = self._read_command_target(key)
+                    normalized_command = self._normalize_command(command_value)
+                normalized_name = self._normalize_text(display_name)
+                display_name, icon, target_path = self._resolve_display_info(
+                    handler_kind=handler_kind,
+                    default_value=str(default_value) if default_value else "",
+                    key_handle=key,
+                    fallback_name=display_name,
+                )
         except FileNotFoundError:
             return None
-        status = "参照のみ" if read_only else ("有効" if enabled else "無効")
+        status = "read-only" if read_only else ("enabled" if enabled else "disabled")
         return HandlerEntry(
             name=display_name,
+            type="shell" if handler_kind == "shell" else "shellex",
             key_name=key_name,
             scope=scope,
             registry_path=registry_path,
             base_path=base_path,
+            base_rel_path=base_path,
             enabled=True if read_only else enabled,
             last_modified=timestamp,
+            last_write_time=last_write_time,
             status=status,
             read_only=read_only,
-        )
+            icon=icon,
+            target_path=target_path,
+            tooltip=self._format_tooltip(target_path, registry_path, status),
+            clsid=clsid_value,
+            command=command_value,
+            normalized_name=normalized_name,
+            normalized_command=normalized_command,
+            full_key_path=f"HKEY_CLASSES_ROOT\\{registry_path}",
+            is_quarantined="LcmQuarantine" in registry_path,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Metadata helpers
+    # ------------------------------------------------------------------ #
+    def _resolve_display_info(
+        self,
+        *,
+        handler_kind: str,
+        default_value: str,
+        key_handle,
+        fallback_name: str,
+    ) -> Tuple[str, Optional[QIcon], Optional[str]]:
+        if handler_kind == "shellex":
+            return self._resolve_shellex_info(default_value, fallback_name)
+        return self._resolve_shell_info(key_handle, fallback_name, default_value)
+
+    def _resolve_shellex_info(self, default_value: str, fallback_name: str) -> Tuple[str, Optional[QIcon], Optional[str]]:
+        clsid = default_value.strip()
+        display_name = fallback_name
+        target_path: Optional[str] = None
+        icon: Optional[QIcon] = None
+        if clsid.startswith("{") and clsid.endswith("}"):
+            name, server_path = self._clsid_to_name(clsid, fallback_name)
+            display_name = name or fallback_name
+            target_path = server_path
+            icon = self._icon_from_file(server_path)
+        else:
+            product_name = self._file_product_name(default_value)
+            if product_name:
+                display_name = product_name
+        return display_name, icon, target_path
+
+    def _resolve_shell_info(
+        self,
+        key_handle,
+        fallback_name: str,
+        default_value: str,
+    ) -> Tuple[str, Optional[QIcon], Optional[str]]:
+        display_name = self._safe_query_value(key_handle, "MUIVerb") or default_value or fallback_name
+        if display_name.startswith("@"):
+            resolved = self._resolve_mui_string(display_name)
+            if resolved:
+                display_name = resolved
+
+        icon_value = self._safe_query_value(key_handle, "Icon")
+        icon, icon_path = self._icon_from_icon_value(icon_value)
+        command_target = self._read_command_target(key_handle)
+        target_path = icon_path or command_target
+        if not icon and not target_path and default_value:
+            icon = self._icon_from_file(default_value)
+            target_path = default_value
+        return display_name, icon, target_path
+
+    def _safe_query_value(self, key_handle, name: Optional[str]) -> str:
+        try:
+            value, _ = winreg.QueryValueEx(key_handle, name)
+            if isinstance(value, bytes):
+                try:
+                    value = value.decode("utf-16le")
+                except UnicodeDecodeError:
+                    value = value.decode("utf-8", errors="ignore")
+            return str(value)
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            return ""
+
+    def _resolve_mui_string(self, value: str) -> str:
+        buffer = ctypes.create_unicode_buffer(MAX_PATH)
+        try:
+            res = shlwapi.SHLoadIndirectString(value, buffer, MAX_PATH, None)
+            if res == 0:
+                return buffer.value.strip()
+        except Exception:
+            self.logger.debug("Failed to resolve MUI string: %s", value, exc_info=True)
+        return value
+
+    def _parse_icon_location(self, value: str) -> Tuple[str, int]:
+        cleaned = value.strip().strip('"')
+        if cleaned.startswith("@"):
+            cleaned = cleaned[1:]
+        if "," in cleaned:
+            path_part, index_part = cleaned.split(",", 1)
+            try:
+                return path_part.strip().strip('"'), int(index_part.strip())
+            except ValueError:
+                return path_part.strip().strip('"'), 0
+        return cleaned, 0
+
+    def _icon_from_icon_value(self, value: str) -> Tuple[Optional[QIcon], Optional[str]]:
+        if not value:
+            return None, None
+        path, index = self._parse_icon_location(value)
+        expanded = self._expand_path(path)
+        if not expanded:
+            return None, None
+        icon = self._icon_from_file(expanded, index)
+        return icon, expanded
+
+    def _clsid_to_name(self, clsid: str, fallback: str) -> Tuple[str, Optional[str]]:
+        display_name = ""
+        server_path: Optional[str] = None
+        try:
+            with winreg.OpenKey(HKCR, f"CLSID\\{clsid}", 0, READ_FLAGS) as clsid_key:
+                display_name = self._safe_query_value(clsid_key, None)
+                try:
+                    with winreg.OpenKey(clsid_key, "InprocServer32", 0, READ_FLAGS) as inproc_key:
+                        server_path = self._safe_query_value(inproc_key, None)
+                except FileNotFoundError:
+                    pass
+        except FileNotFoundError:
+            pass
+        expanded = self._expand_path(server_path)
+        if not display_name:
+            display_name = self._file_product_name(expanded) or clsid or fallback
+        return display_name or fallback, expanded
+
+    def _read_command_target(self, key_handle) -> Optional[str]:
+        try:
+            with winreg.OpenKey(key_handle, "command", 0, READ_FLAGS) as command_key:
+                value = self._safe_query_value(command_key, None)
+                return value or None
+        except FileNotFoundError:
+            return None
+
+    def _expand_path(self, path: Optional[str]) -> Optional[str]:
+        if not path:
+            return None
+        stripped = path.strip().strip('"')
+        if not stripped:
+            return None
+        expanded = os.path.expandvars(stripped)
+        return expanded
+
+    def _icon_from_file(self, path: Optional[str], index: int = 0) -> Optional[QIcon]:
+        if not path:
+            return None
+        expanded = self._expand_path(path)
+        if not expanded:
+            return None
+        cache_key = f"{expanded}|{index}"
+        if cache_key in self._icon_cache:
+            return self._icon_cache[cache_key]
+        try:
+            large = wintypes.HICON()
+            small = wintypes.HICON()
+            extracted = shell32.ExtractIconExW(expanded, index, ctypes.byref(large), ctypes.byref(small), 1)
+            handles = [large.value, small.value]
+            chosen = small.value or large.value
+            icon = None
+            if extracted > 0 and chosen:
+                icon = self._icon_from_handle(chosen)
+                for handle in handles:
+                    if handle and handle != chosen:
+                        self._destroy_icon_handle(handle)
+            if not icon:
+                info = SHFILEINFO()
+                flags = SHGFI_ICON | SHGFI_SMALLICON
+                if not os.path.exists(expanded):
+                    flags |= SHGFI_USEFILEATTRIBUTES
+                res = shell32.SHGetFileInfoW(expanded, 0, ctypes.byref(info), ctypes.sizeof(info), flags)
+                if res and info.hIcon:
+                    icon = self._icon_from_handle(info.hIcon)
+            if icon:
+                self._icon_cache[cache_key] = icon
+            return icon
+        except Exception:
+            self.logger.debug("Failed to extract icon from %s", expanded, exc_info=True)
+            return None
+
+    def _icon_from_handle(self, handle) -> Optional[QIcon]:
+        if not handle:
+            return None
+        pixmap = QPixmap.fromWinHICON(int(handle))
+        self._destroy_icon_handle(handle)
+        if pixmap.isNull():
+            return None
+        return QIcon(pixmap)
+
+    def _destroy_icon_handle(self, handle):
+        if not handle:
+            return
+        try:
+            user32.DestroyIcon(handle)
+        except Exception:
+            pass
+
+    def _file_product_name(self, path: Optional[str]) -> Optional[str]:
+        expanded = self._expand_path(path)
+        if not expanded or not os.path.exists(expanded):
+            return None
+        try:
+            handle = wintypes.DWORD()
+            size = version.GetFileVersionInfoSizeW(expanded, ctypes.byref(handle))
+            if not size:
+                return None
+            data = ctypes.create_string_buffer(size)
+            if not version.GetFileVersionInfoW(expanded, 0, size, data):
+                return None
+            translate_ptr = ctypes.c_void_p()
+            translate_len = wintypes.UINT()
+            langs: List[Tuple[int, int]] = []
+            if version.VerQueryValueW(data, r"\\VarFileInfo\\Translation", ctypes.byref(translate_ptr), ctypes.byref(translate_len)):
+                entry_count = translate_len.value // ctypes.sizeof(wintypes.WORD) // 2
+                array_type = wintypes.WORD * (entry_count * 2)
+                translations = ctypes.cast(translate_ptr.value, ctypes.POINTER(array_type)).contents
+                for i in range(entry_count):
+                    lang = translations[i * 2]
+                    codepage = translations[i * 2 + 1]
+                    langs.append((lang, codepage))
+            if not langs:
+                langs.append((0x0409, 0x04B0))
+            for lang, codepage in langs:
+                sub_block = f"\\StringFileInfo\\{lang:04X}{codepage:04X}\\ProductName"
+                value_ptr = ctypes.c_void_p()
+                value_len = wintypes.UINT()
+                if version.VerQueryValueW(data, sub_block, ctypes.byref(value_ptr), ctypes.byref(value_len)):
+                    if value_ptr.value:
+                        return ctypes.wstring_at(value_ptr.value, value_len.value).strip()
+        except Exception:
+            self.logger.debug("Failed to query version info for %s", expanded, exc_info=True)
+        return None
+
+    def _format_tooltip(self, target_path: Optional[str], registry_path: str, status: str) -> str:
+        target = target_path or "不明"
+        full_key = f"HKEY_CLASSES_ROOT\\{registry_path}"
+        return f"実体: {target}\nキー: {full_key}\n状態: {status}"
+
+    def _normalize_text(self, value: str) -> str:
+        return re.sub(r"\s+", " ", value or "").strip().lower()
+
+    def _normalize_command(self, command: Optional[str]) -> str:
+        if not command:
+            return ""
+        cleaned = command.replace('"', "").replace("'", "").strip().lower()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        parts = cleaned.split(" ")
+        if not parts:
+            return ""
+        base = parts[0]
+        args = " ".join(parts[1:])
+        return f"{base} {args}".strip()
+
+    def clsid_registry_path(self, entry: HandlerEntry) -> Optional[str]:
+        clsid = entry.clsid
+        if not clsid:
+            return None
+        return f"HKEY_CLASSES_ROOT\\CLSID\\{clsid}"
 
     # ------------------------------------------------------------------ #
     # Enable / Disable
@@ -167,7 +523,7 @@ class RegistryManager:
         self._move_tree(source, destination)
         entry.registry_path = destination
         entry.enabled = enable
-        entry.status = "有効" if enable else "無効"
+        entry.status = "enabled" if enable else "disabled"
 
     def _compose_destination(self, base_path: str, key_name: str, enable: bool) -> str:
         if enable:
@@ -185,6 +541,155 @@ class RegistryManager:
         self._delete_tree(destination_path)
         self._copy_tree(source_path, destination_path)
         self._delete_tree(source_path)
+
+    def move_key(self, source_path: str, destination_path: str):
+        """Public helper for quarantine operations that wraps _move_tree."""
+        self.logger.info("Quarantining %s -> %s", source_path, destination_path)
+        self._move_tree(source_path, destination_path)
+
+    def _quarantine_destination(self, entry: HandlerEntry) -> str:
+        return f"{entry.base_rel_path}\\DisabledHandlers\\LcmQuarantine\\{entry.key_name}"
+
+    def quarantine_key(self, entry: HandlerEntry) -> str:
+        dest_rel = self._quarantine_destination(entry)
+        self.move_key(entry.registry_path, dest_rel)
+        with winreg.OpenKey(HKCR, dest_rel, 0, WRITE_FLAGS) as key:
+            winreg.SetValueEx(key, "LCM_OriginalPath", 0, winreg.REG_SZ, entry.registry_path)
+            winreg.SetValueEx(key, "LCM_Timestamp", 0, winreg.REG_SZ, datetime.utcnow().isoformat())
+            winreg.SetValueEx(key, "LCM_Version", 0, winreg.REG_SZ, "1")
+        entry.is_quarantined = True
+        entry.quarantine_meta = {
+            "original": entry.registry_path,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        entry.registry_path = dest_rel
+        return dest_rel
+
+
+@dataclass
+class DuplicateGroup:
+    reason: Literal["name", "command"]
+    key: str
+    entries: List[HandlerEntry]
+    suggested_keep_index: int
+
+
+def group_duplicates(handlers: List[HandlerEntry]) -> List[DuplicateGroup]:
+    groups: List[DuplicateGroup] = []
+    seen_keys: Set[Tuple[str, str]] = set()
+
+    def _select_keep(entries: List[HandlerEntry]) -> int:
+        sorted_list = sorted(
+            enumerate(entries),
+            key=lambda pair: (pair[1].last_write_time or datetime.min),
+            reverse=True,
+        )
+        return sorted_list[0][0]
+
+    def _group(map_key: Tuple[str, str], entries: List[HandlerEntry], reason: str):
+        if len(entries) < 2:
+            return
+        if (reason, map_key) in seen_keys:
+            return
+        seen_keys.add((reason, map_key))
+        keep_index = _select_keep(entries)
+        group_key = "|".join(map_key)
+        groups.append(
+            DuplicateGroup(
+                reason=reason,
+                key=group_key,
+                entries=entries,
+                suggested_keep_index=keep_index,
+            )
+        )
+
+    for reason, key_extractor in [
+        ("name", lambda e: (e.scope, e.type, e.normalized_name)),
+        ("command", lambda e: (e.scope, e.type, e.normalized_command or "")),
+    ]:
+        buckets: Dict[Tuple[str, str, str], List[HandlerEntry]] = {}
+        for entry in handlers:
+            key = key_extractor(entry)
+            if not key[2]:
+                continue
+            buckets.setdefault(key, []).append(entry)
+        for key, entries in buckets.items():
+            _group(key, entries, reason)
+    return groups
+
+
+def _lookup_registry_value(key_path: str, name: str) -> Optional[str]:
+    try:
+        hive, sub = key_path.split("\\", 1)
+        root = getattr(winreg, hive)
+        with winreg.OpenKey(root, sub, 0, READ_FLAGS) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            if isinstance(value, bytes):
+                return value.decode("utf-16", errors="ignore")
+            return str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to read value %s from %s", name, key_path, exc_info=True)
+        return None
+
+
+def _registry_key_exists(key_path: str) -> bool:
+    try:
+        hive, sub = key_path.split("\\", 1)
+        root = getattr(winreg, hive)
+        with winreg.OpenKey(root, sub, 0, READ_FLAGS):
+            return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to check key %s", key_path, exc_info=True)
+        return False
+
+
+def _ensure_full_key_path(path: str) -> str:
+    if not path:
+        return ""
+    normalized = path.strip()
+    if normalized.startswith(HKCR_PREFIX):
+        return normalized
+    stripped = normalized.lstrip("\\")
+    return HKCR_PREFIX + stripped
+
+
+def _strip_full_key_path(path: str) -> str:
+    if path.startswith(HKCR_PREFIX):
+        return path[len(HKCR_PREFIX) :]
+    return path
+
+
+def is_quarantined(entry: HandlerEntry) -> bool:
+    candidate = entry.full_key_path or entry.registry_path or ""
+    if not candidate:
+        return False
+    full_path = _ensure_full_key_path(candidate)
+    if LCM_QUARANTINE_SEG in full_path:
+        return True
+    return bool(_lookup_registry_value(full_path, LCM_ORIGINAL_PATH))
+
+
+def restore_quarantined(entry: HandlerEntry) -> str:
+    full_path = _ensure_full_key_path(entry.full_key_path or entry.registry_path or "")
+    if not full_path or LCM_QUARANTINE_SEG not in full_path:
+        raise RegistryOperationError("Entry is not quarantined")
+    original = _lookup_registry_value(full_path, LCM_ORIGINAL_PATH)
+    if not original:
+        raise RegistryOperationError("Missing original path metadata")
+    dest = original
+    suffix = 1
+    while True:
+        candidate = _ensure_full_key_path(dest)
+        if not _registry_key_exists(candidate):
+            break
+        suffix += 1
+        dest = f"{original}-{suffix}"
+    source = _strip_full_key_path(full_path)
+    manager = RegistryManager()
+    manager.move_key(source, dest)
+    return _ensure_full_key_path(dest)
 
     def _copy_tree(self, source_path: str, destination_path: str):
         try:
@@ -371,6 +876,130 @@ class RegistryManager:
             writer.writerow(["名前", "スコープ", "状態", "レジストリパス", "最終変更日時"])
             writer.writerows(rows)
         return len(rows)
+
+    def _read_registry_value(self, key_path: str, name: str) -> Optional[str]:
+        try:
+            hive, sub = key_path.split("\\", 1)
+            root = getattr(winreg, hive)
+            with winreg.OpenKey(root, sub, 0, READ_FLAGS) as key:
+                value, _ = winreg.QueryValueEx(key, name)
+                if isinstance(value, bytes):
+                    return value.decode("utf-16", errors="ignore")
+                return str(value)
+        except Exception:
+            self.logger.debug("Failed to read value %s from %s", name, key_path, exc_info=True)
+            return None
+
+    def _key_exists(self, key_path: str) -> bool:
+        try:
+            hive, sub = key_path.split("\\", 1)
+            root = getattr(winreg, hive)
+            with winreg.OpenKey(root, sub, 0, READ_FLAGS):
+                return True
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+
+    def _read_registry_value(self, key_path: str, name: str) -> Optional[str]:
+        try:
+            hive, sub = key_path.split("\\", 1)
+            root = getattr(winreg, hive)
+            with winreg.OpenKey(root, sub, 0, READ_FLAGS) as key:
+                value, _ = winreg.QueryValueEx(key, name)
+                if isinstance(value, bytes):
+                    return value.decode("utf-16", errors="ignore")
+                return str(value)
+        except Exception:
+            self.logger.debug("Failed to read value %s from %s", name, key_path, exc_info=True)
+            return None
+
+    def _key_exists(self, key_path: str) -> bool:
+        try:
+            hive, sub = key_path.split("\\", 1)
+            root = getattr(winreg, hive)
+            with winreg.OpenKey(root, sub, 0, READ_FLAGS):
+                return True
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+
+    def is_quarantined(self, entry: HandlerEntry) -> bool:
+        path = entry.full_key_path
+        if not path:
+            return False
+        if LCM_QUARANTINE_SEG in path:
+            return True
+        value = self._read_registry_value(path, LCM_ORIGINAL_PATH)
+        return bool(value)
+
+    def restore_quarantined(self, entry: HandlerEntry) -> str:
+        path = entry.full_key_path
+        if not path or LCM_QUARANTINE_SEG not in path:
+            raise RegistryOperationError("Entry is not quarantined")
+        original = self._read_registry_value(path, LCM_ORIGINAL_PATH)
+        if not original:
+            raise RegistryOperationError("Missing original path metadata")
+        dest = original
+        suffix = 1
+        while self._key_exists(dest):
+            suffix += 1
+            dest = f"{original}-{suffix}"
+        self.move_key(path, dest)
+        return dest
+
+def audit_append(
+    action: str,
+    entry: HandlerEntry,
+    src: str,
+    dst: str,
+    ok: bool,
+    error: str = "",
+):
+    try:
+        appdata = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        audit_dir = appdata / "LightContextMenuManager" / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        filename = audit_dir / f"audit_{now:%Y%m%d}.csv"
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
+        machine = platform.node()
+        row = [
+            now.isoformat(timespec="seconds"),
+            user,
+            machine,
+            action,
+            entry.scope,
+            entry.type,
+            entry.name,
+            src,
+            dst,
+            "OK" if ok else "NG",
+            error,
+        ]
+        exists = filename.exists()
+        with filename.open("a", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\r\n")
+            if not exists:
+                writer.writerow(
+                    [
+                        "timestamp",
+                        "user",
+                        "machine",
+                        "action",
+                        "scope",
+                        "type",
+                        "name",
+                        "src",
+                        "dst",
+                        "result",
+                        "error",
+                    ]
+                )
+            writer.writerow(row)
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to append audit log", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # Shell helper

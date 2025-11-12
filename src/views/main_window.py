@@ -6,6 +6,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -39,16 +40,21 @@ except ImportError:  # pragma: no cover - optional dependency on some wheels
     QtConcurrent = None  # type: ignore[assignment]
     _HAS_QTCONCURRENT = False
 
-from PySide6.QtCore import QModelIndex, Qt, QTimer
-from PySide6.QtGui import QAction, QColor
+from PySide6.QtCore import QModelIndex, Qt, QTimer, Slot
+from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
     QHeaderView,
     QLineEdit,
     QMainWindow,
     QDialog,
-    QDialogButtonBox,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QHBoxLayout,
+    QVBoxLayout,
     QLabel,
+    QPushButton,
+    QRadioButton,
     QMessageBox,
     QProgressDialog,
     QStatusBar,
@@ -56,16 +62,17 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
-    QVBoxLayout,
     QWidget,
     QComboBox,
+    QMenu,
+    QApplication,
 )
 
 from ..audit import AuditLogger
 from ..history import HistoryEntry, HistoryManager
 from ..models import HandlerEntry, HandlerFilterProxyModel, HandlerTableModel
 from ..presets import Preset, PresetManager
-from ..registry import RegistryManager
+from ..registry import DuplicateGroup, RegistryManager, export_to_reg, group_duplicates
 
 
 @dataclass
@@ -88,6 +95,7 @@ class MainWindow(QMainWindow):
         presets: PresetManager,
         audit_logger: AuditLogger,
         audit_path: Path,
+        settings,
         logger: Optional[logging.Logger] = None,
     ):
         super().__init__()
@@ -97,6 +105,7 @@ class MainWindow(QMainWindow):
         self.presets = presets
         self.audit_logger = audit_logger
         self.audit_path = audit_path
+        self.settings = settings
         self.logger = logger or logging.getLogger(__name__)
 
         self.setWindowTitle("Light Context Menu Manager")
@@ -116,6 +125,8 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.setSortingEnabled(True)
         self.table.clicked.connect(self._handle_table_click)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -150,16 +161,40 @@ class MainWindow(QMainWindow):
         self.search_field.textChanged.connect(self.proxy.set_keyword)
         self.toolbar.addWidget(self.search_field)
 
+        self.action_detect_duplicates = QAction("重複を検出", self)
+        self.action_detect_duplicates.triggered.connect(self.on_detect_duplicates)
+        self.toolbar.addAction(self.action_detect_duplicates)
+
+        self.favorite_filter_action = QAction("★のみ", self, checkable=True)
+        self.favorite_filter_action.toggled.connect(self.proxy.set_favorites_only)
+        self.toolbar.addAction(self.favorite_filter_action)
+
+        self.shellex_filter_action = QAction("ShellEx", self, checkable=True)
+        self.shellex_filter_action.toggled.connect(self._on_shellex_filter_toggled)
+        self.toolbar.addAction(self.shellex_filter_action)
+
+        self.shell_filter_action = QAction("shell/verb", self, checkable=True)
+        self.shell_filter_action.toggled.connect(self._on_shell_filter_toggled)
+        self.toolbar.addAction(self.shell_filter_action)
+
+        self.scope_combo = QComboBox(self)
+        self.scope_combo.addItem("スコープ: すべて", None)
+        self.scope_combo.currentIndexChanged.connect(self._on_scope_filter_changed)
+        self.toolbar.addWidget(self.scope_combo)
+
         reload_action = QAction("再読み込み", self)
+        reload_action.setShortcut(QKeySequence.Refresh)
         reload_action.triggered.connect(self.refresh_entries)
         self.toolbar.addAction(reload_action)
 
         self.undo_action = QAction("元に戻す", self)
+        self.undo_action.setShortcut(QKeySequence.Undo)
         self.undo_action.triggered.connect(self.undo_last_action)
         self.undo_action.setEnabled(False)
         self.toolbar.addAction(self.undo_action)
 
         self.redo_action = QAction("やり直し", self)
+        self.redo_action.setShortcut(QKeySequence.Redo)
         self.redo_action.triggered.connect(self.redo_last_action)
         self.redo_action.setEnabled(False)
         self.toolbar.addAction(self.redo_action)
@@ -182,8 +217,13 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.preset_combo)
 
         explorer_action = QAction("Explorer再起動", self)
+        explorer_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
         explorer_action.triggered.connect(self.restart_explorer)
         self.toolbar.addAction(explorer_action)
+
+        self.action_detect_duplicates = QAction("重複を検出", self)
+        self.action_detect_duplicates.triggered.connect(self.on_detect_duplicates)
+        self.toolbar.addAction(self.action_detect_duplicates)
 
         theme_action = QAction("テーマ切替", self, checkable=True)
         theme_action.setChecked(True)
@@ -194,11 +234,110 @@ class MainWindow(QMainWindow):
         audit_action.triggered.connect(self.open_audit_folder)
         self.toolbar.addAction(audit_action)
 
+        edit_action = QAction("編集", self)
+        edit_action.setShortcut(QKeySequence("Ctrl+Return"))
+        edit_action.triggered.connect(self._toggle_selected_entry)
+        self.addAction(edit_action)
+
+        open_registry_action = QAction("レジストリキーを開く", self)
+        open_registry_action.setShortcut(QKeySequence("Ctrl+R"))
+        open_registry_action.triggered.connect(self._open_selected_registry)
+        self.addAction(open_registry_action)
+
     def _populate_preset_combo(self):
         self.preset_combo.clear()
         self.preset_combo.addItem("プリセット適用", None)
         for preset in self.presets.list_presets():
             self.preset_combo.addItem(preset.label, preset.preset_id)
+
+    @Slot()
+    def on_detect_duplicates(self):
+        entries = self.model.entries()
+        groups = group_duplicates(entries)
+        if not groups:
+            QMessageBox.information(self, "重複を検出", "重複は見つかりませんでした。")
+            return
+        dlg = DuplicateDialog(groups, self.registry, self)
+        if dlg.exec() == QDialog.Accepted:
+            quarantined, errors = dlg.run_quarantine_with_backup()
+            if errors:
+                QMessageBox.warning(
+                    self,
+                    "重複の整理",
+                    f"隔離 {quarantined} 件、エラー {len(errors)} 件\n詳細はログを確認してください。",
+                )
+            else:
+                QMessageBox.information(
+                    self, "重複の整理", f"隔離 {quarantined} 件を完了しました。"
+                )
+            ret = QMessageBox.question(
+                self,
+                "Explorer の再起動",
+                "変更を反映するには Explorer の再起動が必要です。再起動しますか？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ret == QMessageBox.Yes:
+                self.restart_explorer()
+            self.refresh_entries()
+    def _sort_entries(self, entries: List[HandlerEntry]) -> List[HandlerEntry]:
+        return sorted(
+            entries,
+            key=lambda e: (
+                bool(not e.is_favorite),
+                e.scope.lower(),
+                e.name.lower(),
+            ),
+        )
+
+    def _reorder_entries(self):
+        entries = self.model.entries()
+        self.model.update_entries(self._sort_entries(entries))
+
+    def _toggle_favorite_entry(self, entry: HandlerEntry):
+        new_state = not entry.is_favorite
+        entry.is_favorite = new_state
+        self.settings.set_favorite(entry.registry_path, new_state)
+        self._reorder_entries()
+
+    def _update_scope_filter_options(self, entries: List[HandlerEntry]):
+        scopes = sorted({entry.scope for entry in entries})
+        current = self.scope_combo.currentData()
+        self.scope_combo.blockSignals(True)
+        self.scope_combo.clear()
+        self.scope_combo.addItem("スコープ: すべて", None)
+        for scope in scopes:
+            self.scope_combo.addItem(scope, scope)
+        target_index = 0
+        if current is not None:
+            idx = self.scope_combo.findData(current)
+            if idx >= 0:
+                target_index = idx
+        self.scope_combo.setCurrentIndex(target_index)
+        self.scope_combo.blockSignals(False)
+        self.proxy.set_scope_filter(self.scope_combo.itemData(target_index))
+
+    def _on_shellex_filter_toggled(self, checked: bool):
+        if checked:
+            self.shell_filter_action.blockSignals(True)
+            self.shell_filter_action.setChecked(False)
+            self.shell_filter_action.blockSignals(False)
+            self.proxy.set_type_filter("shellex")
+        elif not self.shell_filter_action.isChecked():
+            self.proxy.set_type_filter(None)
+
+    def _on_shell_filter_toggled(self, checked: bool):
+        if checked:
+            self.shellex_filter_action.blockSignals(True)
+            self.shellex_filter_action.setChecked(False)
+            self.shellex_filter_action.blockSignals(False)
+            self.proxy.set_type_filter("shell")
+        elif not self.shellex_filter_action.isChecked():
+            self.proxy.set_type_filter(None)
+
+    def _on_scope_filter_changed(self, index: int):
+        value = self.scope_combo.itemData(index)
+        self.proxy.set_scope_filter(value)
 
     def _preset_selected(self, index: int):
         if index <= 0:
@@ -220,7 +359,12 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_entries(self, entries: List[HandlerEntry]):
-        self.model.update_entries(entries)
+        favorites = set(self.settings.favorites())
+        for entry in entries:
+            entry.is_favorite = entry.registry_path in favorites
+        sorted_entries = self._sort_entries(entries)
+        self.model.update_entries(sorted_entries)
+        self._update_scope_filter_options(sorted_entries)
         self.table.resizeColumnsToContents()
         self._update_history_actions()
         self.status.showMessage(f"{len(entries)} 件を読み込みました", 4000)
@@ -237,6 +381,71 @@ class MainWindow(QMainWindow):
             return
         desired_state = not entry.enabled
         self._toggle_entry(entry, desired_state, record_history=True)
+
+    def _toggle_selected_entry(self):
+        entry = self._selected_entry()
+        if not entry:
+            return
+        if entry.read_only:
+            QMessageBox.information(self, "情報", "この項目は参照のみです。")
+            return
+        self._toggle_entry(entry, not entry.enabled, record_history=True)
+
+    def _open_selected_registry(self):
+        entry = self._selected_entry()
+        if not entry:
+            return
+        self._open_registry_entry(entry)
+
+    def _selected_entry(self) -> Optional[HandlerEntry]:
+        selection = self.table.selectionModel()
+        if not selection or not selection.selectedRows():
+            return None
+        index = selection.selectedRows()[0]
+        return self.model.entry_at(self.proxy.mapToSource(index).row())
+
+    def _show_context_menu(self, pos):
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        entry = self.model.entry_at(self.proxy.mapToSource(index).row())
+        if not entry:
+            return
+        menu = self._create_context_menu(entry)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _create_context_menu(self, entry: HandlerEntry) -> QMenu:
+        menu = QMenu(self)
+        fav_text = "★に追加" if not entry.is_favorite else "★を解除"
+        fav_action = menu.addAction(fav_text)
+        fav_action.setObjectName("context_toggle_favorite")
+        fav_action.setData("context_toggle_favorite")
+        fav_action.triggered.connect(lambda _, e=entry: self._toggle_favorite_entry(e))
+        menu.addSeparator()
+        edit_action = menu.addAction("編集…")
+        edit_action.setObjectName("context_edit")
+        edit_action.setData("context_edit")
+        edit_action.setEnabled(not entry.read_only)
+        edit_action.triggered.connect(lambda _, e=entry: self._toggle_entry(e, not e.enabled, record_history=True))
+
+        open_target_action = menu.addAction("実体フォルダを開く")
+        open_target_action.setObjectName("context_open_target")
+        open_target_action.setData("context_open_target")
+        open_target_action.setEnabled(self._resolve_target_file(entry) is not None)
+        open_target_action.triggered.connect(lambda _, e=entry: self._open_target_location(e))
+
+        open_action = menu.addAction("レジストリを開く")
+        open_action.setObjectName("context_open_registry")
+        open_action.setData("context_open_registry")
+        open_action.triggered.connect(lambda _, e=entry: self._open_registry_entry(e))
+
+        clsid_path = self.registry.clsid_registry_path(entry)
+        if clsid_path:
+            clsid_action = menu.addAction("CLSIDをレジストリで開く")
+            clsid_action.setObjectName("context_open_clsid")
+            clsid_action.setData("context_open_clsid")
+            clsid_action.triggered.connect(lambda _, path=clsid_path: self._open_registry_key(path))
+        return menu
 
     def _toggle_entry(self, entry: HandlerEntry, desired_state: bool, record_history: bool):
         entry_copy = replace(entry)
@@ -489,6 +698,47 @@ class MainWindow(QMainWindow):
         self.registry.restart_explorer()
         QMessageBox.information(self, "Explorer", "Explorer を再起動しました。")
 
+    def _open_registry_entry(self, entry: HandlerEntry):
+        key_path = f"HKEY_CLASSES_ROOT\\{entry.registry_path}"
+        self._open_registry_key(key_path)
+
+    def _open_registry_key(self, key_path: str):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(key_path)
+        try:
+            subprocess.Popen(["regedit.exe", "/m", key_path])
+        except Exception as exc:
+            self.logger.debug("Failed to open regedit for %s: %s", key_path, exc)
+            QMessageBox.information(self, "レジストリ", f"キーをクリップボードにコピーしました。\n{key_path}")
+        else:
+            QMessageBox.information(
+                self,
+                "レジストリ",
+                f"regedit を開きました。キーはクリップボードにコピー済みです。\n{key_path}",
+            )
+
+    def _resolve_target_file(self, entry: HandlerEntry) -> Optional[str]:
+        path = entry.target_path
+        if not path:
+            return None
+        candidate = path.strip().strip('"')
+        if not os.path.exists(candidate):
+            candidate = candidate.split(" ")[0].strip('"')
+        if os.path.exists(candidate):
+            return candidate
+        return None
+
+    def _open_target_location(self, entry: HandlerEntry):
+        file_path = self._resolve_target_file(entry)
+        if not file_path:
+            QMessageBox.warning(self, "実体を開く", "パスを特定できませんでした。")
+            return
+        try:
+            subprocess.Popen(["explorer.exe", "/select,", file_path])
+        except Exception as exc:
+            self.logger.error("Failed to open explorer for %s: %s", file_path, exc)
+            QMessageBox.warning(self, "実体を開く", f"フォルダを開けませんでした: {exc}")
+
     def open_audit_folder(self):
         try:
             self.audit_path.mkdir(parents=True, exist_ok=True)
@@ -650,3 +900,202 @@ class PresetPreviewDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+
+class DuplicateDialog(QDialog):
+    def __init__(self, groups: List[DuplicateGroup], registry: RegistryManager, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("重複メニューの整理")
+        self.groups = groups
+        self.registry = registry
+        self._keep_indices: Dict[int, int] = {
+            idx: group.suggested_keep_index for idx, group in enumerate(groups)
+        }
+
+        self.lbl = QLabel(self._summary_text(), self)
+        self.tree = QTreeWidget(self)
+        self.tree.setColumnCount(6)
+        self.tree.setHeaderLabels(["保持", "名前", "種別", "スコープ", "コマンド/CLSID", "最終更新"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.itemClicked.connect(self._on_item_clicked)
+        self._populate_tree()
+
+        btn_defaults = QPushButton("全て提案に戻す", self)
+        btn_defaults.clicked.connect(self._reset_to_suggested)
+        btn_ok = QPushButton("実行", self)
+        btn_cancel = QPushButton("キャンセル", self)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.lbl)
+        layout.addWidget(self.tree)
+        bl = QHBoxLayout()
+        bl.addStretch(1)
+        bl.addWidget(btn_defaults)
+        bl.addWidget(btn_ok)
+        bl.addWidget(btn_cancel)
+        layout.addLayout(bl)
+        self.resize(960, 640)
+
+    def _summary_text(self) -> str:
+        total_groups = len(self.groups)
+        total_entries = sum(len(g.entries) for g in self.groups)
+        quarantine_plan = total_entries - total_groups
+        return f"重複グループ: {total_groups} / 隔離予定: {quarantine_plan}"
+
+    def _populate_tree(self):
+        self.tree.clear()
+        for gi, group in enumerate(self.groups):
+            root = QTreeWidgetItem(self.tree, [f"{group.reason.upper()} 重複", "", "", "", "", ""])
+            root.setFirstColumnSpanned(True)
+            root.setExpanded(True)
+            for ei, entry in enumerate(group.entries):
+                item = QTreeWidgetItem(root)
+                radio = QRadioButton()
+                radio.setChecked(ei == self._keep_indices[gi])
+                radio.toggled.connect(self._make_radio_handler(gi, ei))
+                w = QWidget()
+                hb = QHBoxLayout(w)
+                hb.setContentsMargins(6, 0, 0, 0)
+                hb.addWidget(radio)
+                hb.addStretch(1)
+                self.tree.setItemWidget(item, 0, w)
+
+                item.setText(1, entry.name)
+                item.setText(2, "shell/verb" if entry.type == "verb" else "ShellEx")
+                item.setText(3, entry.scope)
+                item.setText(4, entry.command or entry.clsid or "")
+                lw = entry.last_write_time.strftime("%Y-%m-%d %H:%M:%S") if entry.last_write_time else ""
+                item.setText(5, lw)
+                if ei != self._keep_indices[gi]:
+                    for col in range(1, 6):
+                        item.setForeground(col, Qt.gray)
+
+    def _make_radio_handler(self, gi: int, ei: int):
+        def handler(checked):
+            if checked:
+                self._keep_indices[gi] = ei
+                self._populate_tree()
+                self.lbl.setText(self._summary_text())
+
+        return handler
+
+    def _reset_to_suggested(self):
+        self._keep_indices = {
+            i: g.suggested_keep_index for i, g in enumerate(self.groups)
+        }
+        self._populate_tree()
+        self.lbl.setText(self._summary_text())
+
+    def run_quarantine_with_backup(self) -> Tuple[int, List[str]]:
+        to_quarantine: List[HandlerEntry] = []
+        for gi, group in enumerate(self.groups):
+            keep_idx = self._keep_indices.get(gi, group.suggested_keep_index)
+            for ei, entry in enumerate(group.entries):
+                if ei != keep_idx:
+                    to_quarantine.append(entry)
+        backup_paths = [entry.full_key_path for entry in to_quarantine]
+        if backup_paths:
+            export_to_reg(backup_paths)
+        quarantined = 0
+        errors: List[str] = []
+        for entry in to_quarantine:
+            try:
+                self.registry.quarantine_key(entry)
+                quarantined += 1
+            except Exception as ex:
+                errors.append(f"{entry.full_key_path}: {ex}")
+        return quarantined, errors
+
+
+class DuplicateDialog(QDialog):
+    def __init__(self, groups: List[DuplicateGroup], registry: RegistryManager, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("重複検出")
+        self.resize(900, 600)
+        self.registry = registry
+        self.groups = groups
+        self.selection: Dict[int, int] = {
+            idx: group.suggested_keep_index for idx, group in enumerate(groups)
+        }
+
+        layout = QVBoxLayout(self)
+        self.tree = QTreeWidget(self)
+        self.tree.setColumnCount(6)
+        self.tree.setHeaderLabels(["保持", "名前", "種別", "スコープ", "コマンド/CLSID", "最終更新"])
+        self.tree.itemClicked.connect(self._on_item_clicked)
+        layout.addWidget(self.tree)
+
+        self._populate_tree()
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.cancel_btn = QPushButton("キャンセル", self)
+        self.cancel_btn.clicked.connect(self.reject)
+        self.ok_btn = QPushButton("隔離を実行", self)
+        self.ok_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addWidget(self.ok_btn)
+        layout.addLayout(btn_layout)
+
+    def _populate_tree(self):
+        self.tree.clear()
+        for idx, group in enumerate(self.groups):
+            group_item = QTreeWidgetItem(self.tree)
+            group_item.setFirstColumnSpanned(True)
+            group_item.setText(0, f"{group.reason.upper()} - {group.key}")
+            group_item.setExpanded(True)
+            for entry_index, entry in enumerate(group.entries):
+                child = QTreeWidgetItem(group_item)
+                child.setText(1, entry.name)
+                child.setText(2, entry.type)
+                child.setText(3, entry.scope)
+                child.setText(4, entry.command or entry.clsid or "")
+                lw = entry.last_write_time.strftime("%Y-%m-%d %H:%M:%S") if entry.last_write_time else ""
+                child.setText(5, lw)
+                keeps = self.selection[idx] == entry_index
+                child.setText(0, "保持" if keeps else "隔離")
+                child.setData(0, Qt.UserRole, (idx, entry_index))
+
+    def _on_item_clicked(self, item: QTreeWidgetItem, column: int):
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        group_idx, entry_idx = data
+        if self.selection.get(group_idx) == entry_idx:
+            return
+        self.selection[group_idx] = entry_idx
+        start = self.tree.topLevelItem(group_idx)
+        if not start:
+            return
+        for child_idx in range(start.childCount()):
+            child = start.child(child_idx)
+            child.setText(0, "保持" if child_idx == entry_idx else "隔離")
+
+    def run_quarantine_with_backup(self) -> Tuple[int, List[str]]:
+        to_quarantine = []
+        for group_idx, group in enumerate(self.groups):
+            keep_idx = self.selection.get(group_idx, group.suggested_keep_index)
+            for idx, entry in enumerate(group.entries):
+                if idx != keep_idx:
+                    to_quarantine.append(entry)
+        if not to_quarantine:
+            return 0, []
+        backup_path = self._backup_path()
+        self.registry.export_to_reg(to_quarantine, backup_path)
+        quarantined = 0
+        errors = []
+        for entry in to_quarantine:
+            try:
+                self.registry.quarantine_key(entry)
+                quarantined += 1
+            except Exception as exc:
+                errors.append(f"{entry.name}: {exc}")
+        return quarantined, errors
+
+    def _backup_path(self) -> Path:
+        logs_dir = Path(__file__).resolve().parent.parent / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        return logs_dir / f"duplicates_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.reg"
