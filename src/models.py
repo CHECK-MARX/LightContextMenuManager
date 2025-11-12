@@ -24,6 +24,9 @@ class HandlerEntry:
     icon: Optional[QIcon] = None
     target_path: Optional[str] = None
     tooltip: str = ""
+    handler_kind: str = "shellex"
+    is_favorite: bool = False
+    clsid: Optional[str] = None
 
     def to_csv_row(self) -> List[str]:
         timestamp = self.last_modified.isoformat(sep=" ") if self.last_modified else ""
@@ -136,6 +139,9 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
     def __init__(self):
         super().__init__()
         self._keyword = ""
+        self._favorites_only = False
+        self._handler_kind: Optional[str] = None
+        self._scope_filter: Optional[str] = None
         self.setFilterCaseSensitivity(Qt.CaseInsensitive)
 
     def set_keyword(self, keyword: str):
@@ -143,13 +149,28 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
         # invalidate() supersedes invalidateFilter() in Qt6
         self.invalidate()
 
-    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # type: ignore[override]
-        if not self._keyword:
-            return True
+    def set_favorites_only(self, enabled: bool):
+        self._favorites_only = enabled
+        self.invalidate()
 
+    def set_handler_kind(self, handler_kind: Optional[str]):
+        self._handler_kind = handler_kind
+        self.invalidate()
+
+    def set_scope_filter(self, scope: Optional[str]):
+        self._scope_filter = scope
+        self.invalidate()
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # type: ignore[override]
         model: HandlerTableModel = self.sourceModel()  # type: ignore[assignment]
         entry = model.entry_at(source_row)
         if not entry:
+            return False
+        if self._favorites_only and not entry.is_favorite:
+            return False
+        if self._handler_kind and entry.handler_kind != self._handler_kind:
+            return False
+        if self._scope_filter and entry.scope != self._scope_filter:
             return False
         haystack = "|".join(
             [
@@ -162,4 +183,6 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
                 entry.target_path or "",
             ]
         )
-        return self._keyword.lower() in haystack.lower()
+        if self._keyword and self._keyword.lower() not in haystack.lower():
+            return False
+        return True

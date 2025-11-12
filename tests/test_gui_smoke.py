@@ -4,12 +4,15 @@ from pathlib import Path
 from typing import List
 
 import pytest
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QAction, QIcon, QPixmap
+from PySide6.QtWidgets import QMessageBox, QMenu
 
 from src.audit import AuditLogger
 from src.history import HistoryManager
 from src.models import HandlerEntry
 from src.presets import PresetManager
+from src.settings import SettingsManager
 from src.views.main_window import MainWindow
 
 
@@ -39,6 +42,10 @@ class DummyRegistry:
     def restart_explorer(self):
         return True
 
+    def clsid_registry_path(self, entry: HandlerEntry):
+        if entry.clsid:
+            return f"HKEY_CLASSES_ROOT\\CLSID\\{entry.clsid}"
+        return None
 
 class _DialogStub:
     def __init__(self, *args, **kwargs):
@@ -59,6 +66,9 @@ class _DialogStub:
 
 def _sample_entries() -> List[HandlerEntry]:
     base = r"*\\shellex\\ContextMenuHandlers"
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.blue)
+    icon = QIcon(pixmap)
     return [
         HandlerEntry(
             name="Alpha Tool",
@@ -70,6 +80,10 @@ def _sample_entries() -> List[HandlerEntry]:
             last_modified=None,
             status="有効",
             read_only=False,
+            icon=icon,
+            tooltip="実体: alpha\nキー: path\n状態: 有効",
+            handler_kind="shell",
+            target_path=r"C:\Windows\explorer.exe",
         ),
         HandlerEntry(
             name="Beta Service",
@@ -81,6 +95,11 @@ def _sample_entries() -> List[HandlerEntry]:
             last_modified=None,
             status="有効",
             read_only=False,
+            icon=icon,
+            tooltip="実体: beta\nキー: path\n状態: 有効",
+            handler_kind="shellex",
+            target_path=r"C:\Windows\notepad.exe",
+            clsid="{00000000-0000-0000-0000-000000000000}",
         ),
     ]
 
@@ -112,6 +131,7 @@ def test_main_window_smoke(qtbot, tmp_path, monkeypatch):
 
     audit_dir = tmp_path / "audit"
     audit_logger = AuditLogger(audit_dir, enabled=False)
+    settings = SettingsManager(tmp_path / "settings.json")
 
     window = MainWindow(
         registry=registry,
@@ -120,6 +140,7 @@ def test_main_window_smoke(qtbot, tmp_path, monkeypatch):
         presets=presets,
         audit_logger=audit_logger,
         audit_path=audit_dir,
+        settings=settings,
     )
     qtbot.addWidget(window)
 
@@ -158,5 +179,17 @@ def test_main_window_smoke(qtbot, tmp_path, monkeypatch):
 
     window._run_in_background("test", _work, _after)
     qtbot.waitUntil(lambda: result_holder.get("value") == "done")
+
+    index = window.proxy.index(0, 1)
+    assert isinstance(index.data(Qt.DecorationRole), QIcon)
+    assert index.data(Qt.ToolTipRole)
+
+    entry = window.model.entry_at(0)
+    assert entry is not None
+    menu = window._create_context_menu(entry)
+    captured_actions = menu.actions()
+    assert captured_actions
+    assert any(action.data() == "context_open_registry" for action in captured_actions)
+    assert any(action.data() == "context_edit" for action in captured_actions)
 
     window.close()

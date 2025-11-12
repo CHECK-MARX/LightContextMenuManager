@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - optional dependency on some wheels
     _HAS_QTCONCURRENT = False
 
 from PySide6.QtCore import QModelIndex, Qt, QTimer
-from PySide6.QtGui import QAction, QColor
+from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
     QHeaderView,
@@ -90,6 +90,7 @@ class MainWindow(QMainWindow):
         presets: PresetManager,
         audit_logger: AuditLogger,
         audit_path: Path,
+        settings,
         logger: Optional[logging.Logger] = None,
     ):
         super().__init__()
@@ -99,6 +100,7 @@ class MainWindow(QMainWindow):
         self.presets = presets
         self.audit_logger = audit_logger
         self.audit_path = audit_path
+        self.settings = settings
         self.logger = logger or logging.getLogger(__name__)
 
         self.setWindowTitle("Light Context Menu Manager")
@@ -154,16 +156,36 @@ class MainWindow(QMainWindow):
         self.search_field.textChanged.connect(self.proxy.set_keyword)
         self.toolbar.addWidget(self.search_field)
 
+        self.favorite_filter_action = QAction("★のみ", self, checkable=True)
+        self.favorite_filter_action.toggled.connect(self.proxy.set_favorites_only)
+        self.toolbar.addAction(self.favorite_filter_action)
+
+        self.shellex_filter_action = QAction("ShellEx", self, checkable=True)
+        self.shellex_filter_action.toggled.connect(self._on_shellex_filter_toggled)
+        self.toolbar.addAction(self.shellex_filter_action)
+
+        self.shell_filter_action = QAction("shell/verb", self, checkable=True)
+        self.shell_filter_action.toggled.connect(self._on_shell_filter_toggled)
+        self.toolbar.addAction(self.shell_filter_action)
+
+        self.scope_combo = QComboBox(self)
+        self.scope_combo.addItem("スコープ: すべて", None)
+        self.scope_combo.currentIndexChanged.connect(self._on_scope_filter_changed)
+        self.toolbar.addWidget(self.scope_combo)
+
         reload_action = QAction("再読み込み", self)
+        reload_action.setShortcut(QKeySequence.Refresh)
         reload_action.triggered.connect(self.refresh_entries)
         self.toolbar.addAction(reload_action)
 
         self.undo_action = QAction("元に戻す", self)
+        self.undo_action.setShortcut(QKeySequence.Undo)
         self.undo_action.triggered.connect(self.undo_last_action)
         self.undo_action.setEnabled(False)
         self.toolbar.addAction(self.undo_action)
 
         self.redo_action = QAction("やり直し", self)
+        self.redo_action.setShortcut(QKeySequence.Redo)
         self.redo_action.triggered.connect(self.redo_last_action)
         self.redo_action.setEnabled(False)
         self.toolbar.addAction(self.redo_action)
@@ -186,6 +208,7 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.preset_combo)
 
         explorer_action = QAction("Explorer再起動", self)
+        explorer_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
         explorer_action.triggered.connect(self.restart_explorer)
         self.toolbar.addAction(explorer_action)
 
@@ -198,11 +221,80 @@ class MainWindow(QMainWindow):
         audit_action.triggered.connect(self.open_audit_folder)
         self.toolbar.addAction(audit_action)
 
+        edit_action = QAction("編集", self)
+        edit_action.setShortcut(QKeySequence("Ctrl+Return"))
+        edit_action.triggered.connect(self._toggle_selected_entry)
+        self.addAction(edit_action)
+
+        open_registry_action = QAction("レジストリキーを開く", self)
+        open_registry_action.setShortcut(QKeySequence("Ctrl+R"))
+        open_registry_action.triggered.connect(self._open_selected_registry)
+        self.addAction(open_registry_action)
+
     def _populate_preset_combo(self):
         self.preset_combo.clear()
         self.preset_combo.addItem("プリセット適用", None)
         for preset in self.presets.list_presets():
             self.preset_combo.addItem(preset.label, preset.preset_id)
+
+    def _sort_entries(self, entries: List[HandlerEntry]) -> List[HandlerEntry]:
+        return sorted(
+            entries,
+            key=lambda e: (
+                bool(not e.is_favorite),
+                e.scope.lower(),
+                e.name.lower(),
+            ),
+        )
+
+    def _reorder_entries(self):
+        entries = self.model.entries()
+        self.model.update_entries(self._sort_entries(entries))
+
+    def _toggle_favorite_entry(self, entry: HandlerEntry):
+        new_state = not entry.is_favorite
+        entry.is_favorite = new_state
+        self.settings.set_favorite(entry.registry_path, new_state)
+        self._reorder_entries()
+
+    def _update_scope_filter_options(self, entries: List[HandlerEntry]):
+        scopes = sorted({entry.scope for entry in entries})
+        current = self.scope_combo.currentData()
+        self.scope_combo.blockSignals(True)
+        self.scope_combo.clear()
+        self.scope_combo.addItem("スコープ: すべて", None)
+        for scope in scopes:
+            self.scope_combo.addItem(scope, scope)
+        target_index = 0
+        if current is not None:
+            idx = self.scope_combo.findData(current)
+            if idx >= 0:
+                target_index = idx
+        self.scope_combo.setCurrentIndex(target_index)
+        self.scope_combo.blockSignals(False)
+        self.proxy.set_scope_filter(self.scope_combo.itemData(target_index))
+
+    def _on_shellex_filter_toggled(self, checked: bool):
+        if checked:
+            self.shell_filter_action.blockSignals(True)
+            self.shell_filter_action.setChecked(False)
+            self.shell_filter_action.blockSignals(False)
+            self.proxy.set_handler_kind("shellex")
+        elif not self.shell_filter_action.isChecked():
+            self.proxy.set_handler_kind(None)
+
+    def _on_shell_filter_toggled(self, checked: bool):
+        if checked:
+            self.shellex_filter_action.blockSignals(True)
+            self.shellex_filter_action.setChecked(False)
+            self.shellex_filter_action.blockSignals(False)
+            self.proxy.set_handler_kind("shell")
+        elif not self.shellex_filter_action.isChecked():
+            self.proxy.set_handler_kind(None)
+
+    def _on_scope_filter_changed(self, index: int):
+        value = self.scope_combo.itemData(index)
+        self.proxy.set_scope_filter(value)
 
     def _preset_selected(self, index: int):
         if index <= 0:
@@ -224,7 +316,12 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_entries(self, entries: List[HandlerEntry]):
-        self.model.update_entries(entries)
+        favorites = set(self.settings.favorites())
+        for entry in entries:
+            entry.is_favorite = entry.registry_path in favorites
+        sorted_entries = self._sort_entries(entries)
+        self.model.update_entries(sorted_entries)
+        self._update_scope_filter_options(sorted_entries)
         self.table.resizeColumnsToContents()
         self._update_history_actions()
         self.status.showMessage(f"{len(entries)} 件を読み込みました", 4000)
@@ -242,6 +339,28 @@ class MainWindow(QMainWindow):
         desired_state = not entry.enabled
         self._toggle_entry(entry, desired_state, record_history=True)
 
+    def _toggle_selected_entry(self):
+        entry = self._selected_entry()
+        if not entry:
+            return
+        if entry.read_only:
+            QMessageBox.information(self, "情報", "この項目は参照のみです。")
+            return
+        self._toggle_entry(entry, not entry.enabled, record_history=True)
+
+    def _open_selected_registry(self):
+        entry = self._selected_entry()
+        if not entry:
+            return
+        self._open_registry_entry(entry)
+
+    def _selected_entry(self) -> Optional[HandlerEntry]:
+        selection = self.table.selectionModel()
+        if not selection or not selection.selectedRows():
+            return None
+        index = selection.selectedRows()[0]
+        return self.model.entry_at(self.proxy.mapToSource(index).row())
+
     def _show_context_menu(self, pos):
         index = self.table.indexAt(pos)
         if not index.isValid():
@@ -249,10 +368,41 @@ class MainWindow(QMainWindow):
         entry = self.model.entry_at(self.proxy.mapToSource(index).row())
         if not entry:
             return
-        menu = QMenu(self)
-        open_action = menu.addAction("レジストリを開く")
-        open_action.triggered.connect(lambda _, e=entry: self._open_registry_entry(e))
+        menu = self._create_context_menu(entry)
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _create_context_menu(self, entry: HandlerEntry) -> QMenu:
+        menu = QMenu(self)
+        fav_text = "★に追加" if not entry.is_favorite else "★を解除"
+        fav_action = menu.addAction(fav_text)
+        fav_action.setObjectName("context_toggle_favorite")
+        fav_action.setData("context_toggle_favorite")
+        fav_action.triggered.connect(lambda _, e=entry: self._toggle_favorite_entry(e))
+        menu.addSeparator()
+        edit_action = menu.addAction("編集…")
+        edit_action.setObjectName("context_edit")
+        edit_action.setData("context_edit")
+        edit_action.setEnabled(not entry.read_only)
+        edit_action.triggered.connect(lambda _, e=entry: self._toggle_entry(e, not e.enabled, record_history=True))
+
+        open_target_action = menu.addAction("実体フォルダを開く")
+        open_target_action.setObjectName("context_open_target")
+        open_target_action.setData("context_open_target")
+        open_target_action.setEnabled(self._resolve_target_file(entry) is not None)
+        open_target_action.triggered.connect(lambda _, e=entry: self._open_target_location(e))
+
+        open_action = menu.addAction("レジストリを開く")
+        open_action.setObjectName("context_open_registry")
+        open_action.setData("context_open_registry")
+        open_action.triggered.connect(lambda _, e=entry: self._open_registry_entry(e))
+
+        clsid_path = self.registry.clsid_registry_path(entry)
+        if clsid_path:
+            clsid_action = menu.addAction("CLSIDをレジストリで開く")
+            clsid_action.setObjectName("context_open_clsid")
+            clsid_action.setData("context_open_clsid")
+            clsid_action.triggered.connect(lambda _, path=clsid_path: self._open_registry_key(path))
+        return menu
 
     def _toggle_entry(self, entry: HandlerEntry, desired_state: bool, record_history: bool):
         entry_copy = replace(entry)
@@ -507,6 +657,9 @@ class MainWindow(QMainWindow):
 
     def _open_registry_entry(self, entry: HandlerEntry):
         key_path = f"HKEY_CLASSES_ROOT\\{entry.registry_path}"
+        self._open_registry_key(key_path)
+
+    def _open_registry_key(self, key_path: str):
         clipboard = QApplication.clipboard()
         clipboard.setText(key_path)
         try:
@@ -520,6 +673,28 @@ class MainWindow(QMainWindow):
                 "レジストリ",
                 f"regedit を開きました。キーはクリップボードにコピー済みです。\n{key_path}",
             )
+
+    def _resolve_target_file(self, entry: HandlerEntry) -> Optional[str]:
+        path = entry.target_path
+        if not path:
+            return None
+        candidate = path.strip().strip('"')
+        if not os.path.exists(candidate):
+            candidate = candidate.split(" ")[0].strip('"')
+        if os.path.exists(candidate):
+            return candidate
+        return None
+
+    def _open_target_location(self, entry: HandlerEntry):
+        file_path = self._resolve_target_file(entry)
+        if not file_path:
+            QMessageBox.warning(self, "実体を開く", "パスを特定できませんでした。")
+            return
+        try:
+            subprocess.Popen(["explorer.exe", "/select,", file_path])
+        except Exception as exc:
+            self.logger.error("Failed to open explorer for %s: %s", file_path, exc)
+            QMessageBox.warning(self, "実体を開く", f"フォルダを開けませんでした: {exc}")
 
     def open_audit_folder(self):
         try:

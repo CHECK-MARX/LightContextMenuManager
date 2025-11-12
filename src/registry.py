@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import subprocess
+from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -21,7 +22,6 @@ shlwapi = ctypes.windll.shlwapi
 version = ctypes.windll.version
 
 MAX_PATH = 260
-wintypes = ctypes.wintypes
 HRESULT = ctypes.c_long
 
 
@@ -168,10 +168,15 @@ class RegistryManager:
             with winreg.OpenKey(HKCR, registry_path, 0, READ_FLAGS) as key:
                 display_name = key_name
                 default_value = ""
+                clsid_value = None
                 try:
                     default_value, _ = winreg.QueryValueEx(key, None)
                     if default_value:
                         display_name = str(default_value)
+                        if handler_kind == "shellex" and isinstance(default_value, str):
+                            stripped = default_value.strip()
+                            if stripped.startswith("{") and stripped.endswith("}"):
+                                clsid_value = stripped
                 except FileNotFoundError:
                     pass
                 except OSError:
@@ -203,6 +208,8 @@ class RegistryManager:
             icon=icon,
             target_path=target_path,
             tooltip=self._format_tooltip(target_path, registry_path, status),
+            handler_kind=handler_kind,
+            clsid=clsid_value,
         )
 
     # ------------------------------------------------------------------ #
@@ -431,6 +438,12 @@ class RegistryManager:
         target = target_path or "不明"
         full_key = f"HKEY_CLASSES_ROOT\\{registry_path}"
         return f"実体: {target}\nキー: {full_key}\n状態: {status}"
+
+    def clsid_registry_path(self, entry: HandlerEntry) -> Optional[str]:
+        clsid = entry.clsid
+        if not clsid:
+            return None
+        return f"HKEY_CLASSES_ROOT\\CLSID\\{clsid}"
 
     # ------------------------------------------------------------------ #
     # Enable / Disable

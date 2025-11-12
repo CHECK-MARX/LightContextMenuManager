@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 class SettingsManager:
     """Lightweight JSON-backed settings."""
 
-    DEFAULTS: Dict[str, Any] = {"audit_enabled": True}
+    DEFAULTS: Dict[str, Any] = {"audit_enabled": True, "favorites": []}
 
     def __init__(self, path: Path, logger: Optional[logging.Logger] = None):
         self.path = path
@@ -41,3 +41,26 @@ class SettingsManager:
 
     def audit_enabled(self) -> bool:
         return bool(self.data.get("audit_enabled", True))
+
+    def favorites(self) -> List[str]:
+        favorites = self.data.setdefault("favorites", [])
+        if not isinstance(favorites, list):
+            favorites = []
+            self.data["favorites"] = favorites
+        return [str(item) for item in favorites]
+
+    def set_favorite(self, registry_path: str, enabled: bool):
+        favorites = set(self.favorites())
+        if enabled:
+            favorites.add(registry_path)
+        else:
+            favorites.discard(registry_path)
+        self.data["favorites"] = sorted(favorites)
+        self._save()
+
+    def _save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            self.logger.warning("Failed to persist settings: %s", exc)
