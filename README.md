@@ -10,7 +10,7 @@ Windows 11 の右クリックメニューを Python 3.11 + PySide6 で整理す�
    ```
 2. 管理者権限でアプリを起動します (初回起動時に UAC 昇格を自動要求)。
    ```powershell
-   python -m src.main
+   python app.py
    ```
 
 ## 主な機能
@@ -22,7 +22,7 @@ Windows 11 の右クリックメニューを Python 3.11 + PySide6 で整理す�
   - `HKCR\Drive\shellex\ContextMenuHandlers`
   - 参照用: `HKCR\*\shell`, `HKCR\Folder\shell`
 - **有効/無効切替**: キーを `DisabledHandlers` サブキーへ移動して無効化、逆操作で有効化。
-- **ツールバー**: 検索、再読み込み、Undo/Redo、バックアップ(.reg)、復元(.reg)、CSV 出力、プリセット適用、Explorer 再起動、テーマ切替 (qdarktheme)。
+- **ツールバー**: 検索、再読み込み、Undo/Redo、バックアップ(.reg)、復元(.reg)、CSV 出力、プリセット適用、Explorer 再起動、テーマ切替 (組み込み qdarktheme 風パレット)。
 - **監査ログ**: `settings.json` の `audit_enabled` で ON/OFF を切替。ON 時は操作ごとに `audit/audit_YYYYMMDD.csv` へ追記され、ツールバーの「監査フォルダを開く」からフォルダを開けます。
 - **テーブル表示**: QAbstractTableModel + QSortFilterProxyModel による検索/ソート、状態・スコープ・元パス・最終変更日時を表示。
 - **非同期処理**: QtConcurrent + QProgressDialog でスキャンや大量操作中も UI がブロックされないようにしています。

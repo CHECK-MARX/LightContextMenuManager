@@ -44,7 +44,7 @@ try {
     $pyinstallerArgs = @(
         "-m", "PyInstaller",
         "-F", "-w",
-        "src/main.py",
+        "app.py",
         "-n", "LightContextMenuManager",
         "--collect-all", "PySide6",
         "--collect-all", "shiboken6",

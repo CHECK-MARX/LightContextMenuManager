@@ -1,3 +1,2 @@
 ﻿PySide6>=6.6
-pyqtdarktheme>=2.1; python_version < "3.12"
 pytest>=7.0
