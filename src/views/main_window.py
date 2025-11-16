@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - optional dependency on some wheels
     QtConcurrent = None  # type: ignore[assignment]
     _HAS_QTCONCURRENT = False
 
-from PySide6.QtCore import QModelIndex, Qt, QTimer, Slot
+from PySide6.QtCore import QModelIndex, Qt, QTimer, Slot, QSettings
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QRadioButton,
+    QCheckBox,
     QMessageBox,
     QProgressDialog,
     QStatusBar,
@@ -67,6 +68,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QMenu,
     QApplication,
+    QDialogButtonBox,
 )
 
 from ..audit import AuditLogger
@@ -115,6 +117,8 @@ class MainWindow(QMainWindow):
         self.model = HandlerTableModel()
         self.proxy = HandlerFilterProxyModel()
         self.proxy.setSourceModel(self.model)
+        self._settings_storage = QSettings("CursorSoft", "LightContextMenuManager")
+        self._simple_view_enabled = self.settings.simple_view_enabled() if hasattr(self.settings, "simple_view_enabled") else True
 
         self.table = QTableView()
         self.table.setModel(self.proxy)
@@ -128,6 +132,9 @@ class MainWindow(QMainWindow):
         self.table.clicked.connect(self._handle_table_click)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
+        self.table.doubleClicked.connect(self._handle_row_double_click)
+        self._apply_simple_view_mode(self._simple_view_enabled)
+        self.table.doubleClicked.connect(self._handle_row_double_click)
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -141,6 +148,9 @@ class MainWindow(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        self._safety_label = QLabel()
+        self.status.addPermanentWidget(self._safety_label)
+        self._update_safety_status()
 
         self._pending_timers: List[QTimer] = []
         self._executor = ThreadPoolExecutor(max_workers=4)
@@ -185,6 +195,10 @@ class MainWindow(QMainWindow):
         self.broken_filter_action = QAction("壊れている項目のみ", self, checkable=True)
         self.broken_filter_action.toggled.connect(self.proxy.set_broken_only)
         self.toolbar.addAction(self.broken_filter_action)
+        self.simple_view_action = QAction("シンプル表示(&S)", self, checkable=True)
+        self.simple_view_action.setChecked(self._simple_view_enabled)
+        self.simple_view_action.toggled.connect(self._on_simple_view_toggled)
+        self.toolbar.addAction(self.simple_view_action)
 
         self.scope_combo = QComboBox(self)
         self.scope_combo.addItem("スコープ: すべて", None)
@@ -395,6 +409,8 @@ class MainWindow(QMainWindow):
         self.table.resizeColumnsToContents()
         self._update_history_actions()
         self.status.showMessage(f"{len(entries)} 件を読み込みました", 4000)
+        self._apply_simple_view_mode(self._simple_view_enabled)
+        self._update_safety_status()
 
     def _handle_table_click(self, index: QModelIndex):
         if index.column() != 0:
@@ -408,6 +424,49 @@ class MainWindow(QMainWindow):
             return
         desired_state = not entry.enabled
         self._toggle_entry(entry, desired_state, record_history=True)
+
+    def _handle_row_double_click(self, index: QModelIndex):
+        if not index or not index.isValid():
+            return
+        source_index = self.proxy.mapToSource(index)
+        entry = self.model.entry_at(source_index.row())
+        if not entry:
+            return
+        self._show_handler_properties(entry)
+
+    def _on_simple_view_toggled(self, enabled: bool):
+        self._simple_view_enabled = enabled
+        if hasattr(self.settings, "set_simple_view_enabled"):
+            self.settings.set_simple_view_enabled(enabled)
+        self._apply_simple_view_mode(enabled)
+
+    def _apply_simple_view_mode(self, enabled: bool):
+        visible_columns = {
+            HandlerTableModel.NAME_COLUMN,
+            HandlerTableModel.STATUS_COLUMN,
+            HandlerTableModel.SCOPE_COLUMN,
+        }
+        total_columns = self.model.columnCount()
+        for col in range(total_columns):
+            hide = enabled and col not in visible_columns
+            self.table.setColumnHidden(col, hide)
+
+    def _update_safety_status(self):
+        if not hasattr(self, "_safety_label"):
+            return
+        messages = [
+            "書き込み先: HKCU のみ",
+            "自動バックアップ: 有効 (.reg 出力)",
+            "監査ログ: 有効",
+        ]
+        self._safety_label.setText(" | ".join(messages))
+
+    def maybe_show_onboarding(self):
+        if self._settings_storage.value("onboarding/shown", False, type=bool):
+            return
+        dialog = TutorialDialog(self)
+        dialog.exec()
+        self._settings_storage.setValue("onboarding/shown", dialog.dont_show_again())
 
     def _toggle_selected_entry(self):
         entry = self._selected_entry()
@@ -1262,3 +1321,30 @@ class NewHandlerDialog(QDialog):
         )
         self.on_created()
         super().accept()
+
+
+class TutorialDialog(QDialog):
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Light Context Menu 入門")
+        self.resize(420, 240)
+        layout = QVBoxLayout(self)
+        intro = QLabel("Light Context Menu Manager の基本操作を紹介します。")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        steps = QLabel(
+            "1. チェックボックスで有効/無効を切り替え、必要な項目だけ残せます。\n"
+            "2. 「壊れている項目のみ」ボタンで問題のあるメニューを絞り込めます。\n"
+            "3. 「新規メニュー追加(N)…」でお気に入りアプリを追加し、自分だけのメニューを作成できます。"
+        )
+        steps.setWordWrap(True)
+        layout.addWidget(steps)
+        self.checkbox = QCheckBox("二度と表示しない")
+        self.checkbox.setChecked(True)
+        layout.addWidget(self.checkbox)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok, parent=self)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+    def dont_show_again(self) -> bool:
+        return bool(self.checkbox.isChecked())

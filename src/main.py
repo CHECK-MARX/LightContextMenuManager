@@ -71,6 +71,7 @@ def main():
             logger=logger,
         )
         window.show()
+        window.maybe_show_onboarding()
     except Exception:
         logger.exception("Failed to start UI")
         QMessageBox.critical(None, "致命的なエラー", "アプリケーションを起動できませんでした。ログを確認してください。")

@@ -9,7 +9,11 @@ from typing import Any, Dict, Optional
 class SettingsManager:
     """Lightweight JSON-backed settings."""
 
-    DEFAULTS: Dict[str, Any] = {"audit_enabled": True, "favorites": []}
+    DEFAULTS: Dict[str, Any] = {
+        "audit_enabled": True,
+        "favorites": [],
+        "simple_view_enabled": True,
+    }
 
     def __init__(self, path: Path, logger: Optional[logging.Logger] = None):
         self.path = path
@@ -48,6 +52,13 @@ class SettingsManager:
             favorites = []
             self.data["favorites"] = favorites
         return [str(item) for item in favorites]
+
+    def simple_view_enabled(self) -> bool:
+        return bool(self.data.get("simple_view_enabled", True))
+
+    def set_simple_view_enabled(self, enabled: bool):
+        self.data["simple_view_enabled"] = bool(enabled)
+        self._save()
 
     def set_favorite(self, registry_path: str, enabled: bool):
         favorites = set(self.favorites())
