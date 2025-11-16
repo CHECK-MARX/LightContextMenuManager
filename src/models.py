@@ -46,6 +46,7 @@ class HandlerEntry:
 class HandlerTableModel(QAbstractTableModel):
     """Qt table model that exposes HandlerEntry metadata to the view."""
 
+    NAME_COLUMN = 1
     headers = [
         "",  # checkbox column
         "名前",
@@ -96,8 +97,8 @@ class HandlerTableModel(QAbstractTableModel):
                 if entry.last_modified:
                     return entry.last_modified.strftime("%Y-%m-%d %H:%M:%S")
                 return ""
-        elif role == Qt.DecorationRole and column == 1:
-            return entry.icon
+        elif role == Qt.DecorationRole and column == self.NAME_COLUMN:
+            return entry.icon or None
         elif role == Qt.ToolTipRole:
             return entry.tooltip
         elif role == Qt.ForegroundRole:

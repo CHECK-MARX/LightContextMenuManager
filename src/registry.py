@@ -320,9 +320,12 @@ class RegistryManager:
         icon_value = self._safe_query_value(key_handle, "Icon")
         icon, icon_path = self._icon_from_icon_value(icon_value)
         command_target = self._read_command_target(key_handle)
-        target_path = icon_path or command_target
-        if not icon and command_target:
-            icon = self._icon_from_file(command_target)
+        executable = self._extract_command_executable(command_target)
+        target_path = icon_path or executable or command_target
+        if not icon:
+            candidate = executable or command_target
+            if candidate:
+                icon = self._icon_from_file(candidate)
         if not icon and not target_path and default_value:
             icon = self._icon_from_file(default_value)
             target_path = default_value
