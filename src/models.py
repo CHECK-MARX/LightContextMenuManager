@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QSortFilterProxyModel
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QColor
 
 
 @dataclass
@@ -13,7 +13,6 @@ class HandlerEntry:
     """Represents a single context menu handler row."""
 
     name: str
-    type: Literal["verb", "shellex"]
     type: Literal["verb", "shellex"]
     scope: str
     key_name: str
@@ -26,6 +25,7 @@ class HandlerEntry:
     last_write_time: Optional[datetime]
     status: str
     read_only: bool = False
+    is_favorite: bool = False
     command: Optional[str] = None
     normalized_name: str = ""
     normalized_command: Optional[str] = None
@@ -35,6 +35,8 @@ class HandlerEntry:
     clsid: Optional[str] = None
     is_quarantined: bool = False
     quarantine_meta: Optional[Dict[str, str]] = None
+    is_broken: bool = False
+    broken_reason: Optional[str] = None
 
     def to_csv_row(self) -> List[str]:
         timestamp = self.last_modified.isoformat(sep=" ") if self.last_modified else ""
@@ -84,7 +86,10 @@ class HandlerTableModel(QAbstractTableModel):
             if column == 3:
                 return entry.base_path
             if column == 4:
-                return entry.status
+                status = entry.status
+                if entry.is_broken:
+                    status = "broken" if entry.enabled else "broken (disabled)"
+                return status
             if column == 5:
                 return entry.registry_path
             if column == 6:
@@ -95,6 +100,9 @@ class HandlerTableModel(QAbstractTableModel):
             return entry.icon
         elif role == Qt.ToolTipRole:
             return entry.tooltip
+        elif role == Qt.ForegroundRole:
+            if entry.is_broken:
+                return QColor("#ff6b6b")
         elif role == Qt.CheckStateRole and column == 0:
             return Qt.Checked if entry.enabled else Qt.Unchecked
         elif role == Qt.TextAlignmentRole and column in (2, 3, 4, 5, 6):
@@ -148,6 +156,7 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
         super().__init__()
         self._keyword = ""
         self._favorites_only = False
+        self._broken_only = False
         self._type_filter: Optional[str] = None
         self._scope_filter: Optional[str] = None
         self.setFilterCaseSensitivity(Qt.CaseInsensitive)
@@ -159,6 +168,10 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
 
     def set_favorites_only(self, enabled: bool):
         self._favorites_only = enabled
+        self.invalidate()
+
+    def set_broken_only(self, enabled: bool):
+        self._broken_only = enabled
         self.invalidate()
 
     def set_type_filter(self, handler_type: Optional[str]):
@@ -173,6 +186,8 @@ class HandlerFilterProxyModel(QSortFilterProxyModel):
         model: HandlerTableModel = self.sourceModel()  # type: ignore[assignment]
         entry = model.entry_at(source_row)
         if not entry:
+            return False
+        if self._broken_only and not entry.is_broken:
             return False
         if self._favorites_only and not entry.is_favorite:
             return False
