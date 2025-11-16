@@ -12,10 +12,10 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import winreg
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPixmap
 
 from .models import HandlerEntry
 
@@ -303,6 +303,8 @@ class RegistryManager:
             product_name = self._file_product_name(default_value)
             if product_name:
                 display_name = product_name
+        if not icon:
+            icon = self._default_icon()
         return display_name, icon, target_path
 
     def _resolve_shell_info(
@@ -329,6 +331,8 @@ class RegistryManager:
         if not icon and not target_path and default_value:
             icon = self._icon_from_file(default_value)
             target_path = default_value
+        if not icon:
+            icon = self._default_icon()
         return display_name, icon, target_path
 
     def _safe_query_value(self, key_handle, name: Optional[str]) -> str:
@@ -439,10 +443,15 @@ class RegistryManager:
                     icon = self._icon_from_handle(info.hIcon)
             if icon:
                 self._icon_cache[cache_key] = icon
-            return icon
+                return icon
         except Exception:
             self.logger.debug("Failed to extract icon from %s", expanded, exc_info=True)
             return None
+
+    def _default_icon(self) -> QIcon:
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(QColor("#444444"))
+        return QIcon(pixmap)
 
     def _icon_from_handle(self, handle) -> Optional[QIcon]:
         if not handle:
@@ -579,16 +588,57 @@ class RegistryManager:
             data = ctypes.create_string_buffer(size)
             if not version.GetFileVersionInfoW(path, 0, size, data):
                 return metadata
-            for name in ("FileDescription", "ProductName", "CompanyName"):
-                sub_block = f"\\StringFileInfo\\040904B0\\{name}"
-                value_ptr = ctypes.c_void_p()
-                value_len = wintypes.UINT()
-                if version.VerQueryValueW(data, sub_block, ctypes.byref(value_ptr), ctypes.byref(value_len)):
-                    if value_ptr.value:
-                        metadata[name.lower()] = ctypes.wstring_at(value_ptr.value, value_len.value).strip()
+            translations = self._get_translations(data) or [(0x0409, 0x04B0)]
+            for lang, codepage in translations:
+                for name in ("FileDescription", "ProductName", "CompanyName"):
+                    if metadata[name.lower()]:
+                        continue
+                    sub_block = f"\\StringFileInfo\\{lang:04X}{codepage:04X}\\{name}"
+                    value_ptr = ctypes.c_void_p()
+                    value_len = wintypes.UINT()
+                    if version.VerQueryValueW(data, sub_block, ctypes.byref(value_ptr), ctypes.byref(value_len)):
+                        if value_ptr.value:
+                            metadata[name.lower()] = ctypes.wstring_at(value_ptr.value, value_len.value).strip()
         except Exception:
             self.logger.debug("Failed to query version metadata for %s", path, exc_info=True)
         return metadata
+
+    def _get_translations(self, data) -> List[Tuple[int, int]]:
+        translations: List[Tuple[int, int]] = []
+        trans_ptr = ctypes.c_void_p()
+        trans_len = wintypes.UINT()
+        if version.VerQueryValueW(
+            data,
+            r"\\VarFileInfo\\Translation",
+            ctypes.byref(trans_ptr),
+            ctypes.byref(trans_len),
+        ):
+            count = trans_len.value // ctypes.sizeof(wintypes.WORD) // 2
+            if count:
+                array_type = wintypes.WORD * (count * 2)
+                values = ctypes.cast(trans_ptr, ctypes.POINTER(array_type)).contents
+                for i in range(count):
+                    lang = values[i * 2]
+                    codepage = values[i * 2 + 1]
+                    translations.append((lang, codepage))
+        return translations
+
+    def _guess_company_from_path(self, path: Optional[Union[str, Path]]) -> Optional[str]:
+        if not path:
+            return None
+        value = str(path)
+        lowered = value.lower()
+        hints = {
+            "trend micro": "Trend Micro",
+            "microsoft": "Microsoft",
+            "nvidia": "NVIDIA",
+            "adobe": "Adobe",
+            "oracle": "Oracle",
+        }
+        for key, value in hints.items():
+            if key in lowered:
+                return value
+        return None
 
     def resolve_handler_metadata(self, entry: HandlerEntry) -> Dict[str, str]:
         metadata: Dict[str, str] = {"path": "", "description": "", "product": "", "company": ""}
@@ -600,7 +650,12 @@ class RegistryManager:
         metadata["path"] = executable or ""
         file_meta = self._file_version_metadata(executable)
         metadata.update(file_meta)
+        if not metadata["company"]:
+            guess = self._guess_company_from_path(Path(executable or ""))
+            if guess:
+                metadata["company"] = f"{guess} (推測)"
         return metadata
+
 
     def _slugify_handler_name(self, value: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "-", value.lower())
