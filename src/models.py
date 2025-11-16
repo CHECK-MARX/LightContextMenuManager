@@ -46,7 +46,13 @@ class HandlerEntry:
 class HandlerTableModel(QAbstractTableModel):
     """Qt table model that exposes HandlerEntry metadata to the view."""
 
+    CHECKBOX_COLUMN = 0
     NAME_COLUMN = 1
+    SCOPE_COLUMN = 2
+    BASE_PATH_COLUMN = 3
+    STATUS_COLUMN = 4
+    REGISTRY_COLUMN = 5
+    LAST_MODIFIED_COLUMN = 6
     headers = [
         "",  # checkbox column
         "名前",
