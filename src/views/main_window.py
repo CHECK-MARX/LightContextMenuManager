@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - optional dependency on some wheels
     _HAS_QTCONCURRENT = False
 
 from PySide6.QtCore import QModelIndex, Qt, QTimer, Slot, QSettings
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPixmap, QPalette
 from PySide6.QtWidgets import (
     QFileDialog,
     QHeaderView,
@@ -547,22 +547,27 @@ class MainWindow(QMainWindow):
         self._preview_widgets.clear()
 
     def _create_preview_widget(self, entry: HandlerEntry) -> QWidget:
-        frame = QFrame()
-        frame.setFrameShape(QFrame.StyledPanel)
-        frame.setFrameShadow(QFrame.Raised)
-        frame.setProperty("registryPath", entry.registry_path)
-        layout = QHBoxLayout(frame)
+        row = QWidget()
+        layout = QHBoxLayout(row)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(8)
+
         icon_label = QLabel()
         icon_label.setFixedSize(20, 20)
         if entry.icon:
             icon_label.setPixmap(entry.icon.pixmap(20, 20))
+        else:
+            icon_label.setVisible(False)
         layout.addWidget(icon_label, alignment=Qt.AlignVCenter)
-        name_label = QLabel(entry.name)
-        name_label.setStyleSheet(f"color: {self._preview_text_color(entry)};")
-        layout.addWidget(name_label, alignment=Qt.AlignVCenter)
-        return frame
+
+        text_label = QLabel(entry.name)
+        palette = text_label.palette()
+        color = self._preview_text_color(entry, palette)
+        text_label.setStyleSheet(f"color: {color};")
+        layout.addWidget(text_label, alignment=Qt.AlignVCenter)
+
+        row.setProperty("registryPath", entry.registry_path)
+        return row
 
     def _update_preview_selection_highlight(self):
         selected_path = self._current_preview_selection
@@ -596,12 +601,12 @@ class MainWindow(QMainWindow):
             type_text = "すべて"
         return f"プレビュー（スコープ: {scope_text}、種別: {type_text}）"
 
-    def _preview_text_color(self, entry: HandlerEntry) -> str:
+    def _preview_text_color(self, entry: HandlerEntry, palette: QPalette) -> str:
         if entry.is_broken:
             return "#ff6b6b"
-        if not entry.enabled:
-            return "#888888"
-        return "#f0f0f0"
+        if "disabled" in entry.status.lower():
+            return palette.color(QPalette.Disabled, QPalette.WindowText).name()
+        return palette.color(QPalette.Active, QPalette.WindowText).name()
 
     def _on_broken_filter_toggled(self, checked: bool):
         self.proxy.set_broken_only(checked)
