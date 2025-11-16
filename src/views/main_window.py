@@ -1155,7 +1155,7 @@ class HandlerPropertiesDialog(QDialog):
             self.registry.update_command(self.entry, command)
             new_icon = self.registry._icon_from_file(exe_path)
             if new_icon:
-        self.entry.icon = new_icon
+                self.entry.icon = new_icon
         except Exception as exc:
             QMessageBox.critical(self, "修復", f"書き換えに失敗しました: {exc}")
             return
