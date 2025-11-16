@@ -567,6 +567,41 @@ class RegistryManager:
             return None
         return None
 
+    def _file_version_metadata(self, path: Optional[str]) -> Dict[str, str]:
+        metadata: Dict[str, str] = {"description": "", "product": "", "company": ""}
+        if not path:
+            return metadata
+        try:
+            buffer = wintypes.DWORD()
+            size = version.GetFileVersionInfoSizeW(path, ctypes.byref(buffer))
+            if not size:
+                return metadata
+            data = ctypes.create_string_buffer(size)
+            if not version.GetFileVersionInfoW(path, 0, size, data):
+                return metadata
+            for name in ("FileDescription", "ProductName", "CompanyName"):
+                sub_block = f"\\StringFileInfo\\040904B0\\{name}"
+                value_ptr = ctypes.c_void_p()
+                value_len = wintypes.UINT()
+                if version.VerQueryValueW(data, sub_block, ctypes.byref(value_ptr), ctypes.byref(value_len)):
+                    if value_ptr.value:
+                        metadata[name.lower()] = ctypes.wstring_at(value_ptr.value, value_len.value).strip()
+        except Exception:
+            self.logger.debug("Failed to query version metadata for %s", path, exc_info=True)
+        return metadata
+
+    def resolve_handler_metadata(self, entry: HandlerEntry) -> Dict[str, str]:
+        metadata: Dict[str, str] = {"path": "", "description": "", "product": "", "company": ""}
+        executable = None
+        if entry.type == "shellex":
+            executable = self._clsid_server_path(entry.clsid)
+        else:
+            executable = self._extract_command_executable(entry.command)
+        metadata["path"] = executable or ""
+        file_meta = self._file_version_metadata(executable)
+        metadata.update(file_meta)
+        return metadata
+
     def _slugify_handler_name(self, value: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "-", value.lower())
         slug = slug.strip("-")

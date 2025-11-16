@@ -1276,6 +1276,21 @@ class HandlerPropertiesDialog(QDialog):
         self.broken_label = QLabel(entry.broken_reason or "正常")
         form.addRow("状態", self.broken_label)
 
+        self.handler_metadata = self.registry.resolve_handler_metadata(entry)
+        self.provider_icon = QLabel()
+        self.provider_icon.setFixedSize(32, 32)
+        self.provider_icon.setAlignment(Qt.AlignCenter)
+        self.provider_icon.setFrameShape(QFrame.Box)
+        self.provider_icon.setLineWidth(1)
+        form.addRow("アイコン", self.provider_icon)
+        self.provider_label = QLabel()
+        self.provider_label.setWordWrap(True)
+        form.addRow("提供元", self.provider_label)
+        self.path_label = QLabel(self.handler_metadata.get("path") or "不明")
+        self.path_label.setWordWrap(True)
+        form.addRow("実体ファイル", self.path_label)
+        self._update_provider_info()
+
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         test_btn = QPushButton("テスト実行")
@@ -1310,19 +1325,48 @@ class HandlerPropertiesDialog(QDialog):
         QMessageBox.information(self, "コピー完了", "レジストリパスをコピーしました。")
 
     def _test_command(self):
+        metadata = self.handler_metadata
         command = self.command_edit.text().strip()
-        exe = self.registry.resolve_command_executable(command)
-        if not exe:
-            QMessageBox.warning(self, "テスト実行", "実行コマンドが設定されていません。")
-            return
-        if not Path(exe).exists():
-            QMessageBox.warning(self, "テスト実行", f"{exe} が存在しません。")
-            return
-        try:
-            subprocess.Popen([exe], cwd=os.path.dirname(exe) or None)
-            QMessageBox.information(self, "テスト実行", "アプリケーションを起動しました。")
-        except Exception as exc:
-            QMessageBox.warning(self, "テスト実行", f"起動に失敗しました: {exc}")
+        if self.entry.type == "shell":
+            exe = self.registry.resolve_command_executable(command)
+            if not exe:
+                QMessageBox.warning(self, "テスト実行", "実行コマンドが設定されていません。")
+                return
+            if not Path(exe).exists():
+                QMessageBox.warning(self, "テスト実行", f"{exe} が存在しません。")
+                return
+            desc = metadata.get("description") or metadata.get("product") or "不明な説明"
+            try:
+                subprocess.Popen([exe], cwd=os.path.dirname(exe) or None)
+                QMessageBox.information(
+                    self,
+                    "テスト実行",
+                    f"実行: {exe}\n説明: {desc or '不明'}",
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "テスト実行", f"起動に失敗しました: {exc}")
+        else:
+            path = metadata.get("path")
+            desc = metadata.get("description") or metadata.get("product") or "不明な説明"
+            if not path:
+                QMessageBox.warning(
+                    self,
+                    "テスト実行",
+                    f"CLSID: {self.entry.clsid or 'なし'} の情報が見つかりません。",
+                )
+                return
+            if not Path(path).exists():
+                QMessageBox.warning(
+                    self,
+                    "テスト実行",
+                    f"{path} が存在しません。\nレジストリ: {self.entry.full_key_path}",
+                )
+                return
+            QMessageBox.information(
+                self,
+                "テスト実行",
+                f"DLL: {path}\n説明: {desc or '不明'}",
+            )
 
     def _repair_command(self):
         if self.entry.read_only:
@@ -1343,6 +1387,8 @@ class HandlerPropertiesDialog(QDialog):
             new_icon = self.registry._icon_from_file(exe_path)
             if new_icon:
                 self.entry.icon = new_icon
+            self.handler_metadata = self.registry.resolve_handler_metadata(self.entry)
+            self._update_provider_info()
         except Exception as exc:
             QMessageBox.critical(self, "修復", f"書き換えに失敗しました: {exc}")
             return
@@ -1368,6 +1414,16 @@ class HandlerPropertiesDialog(QDialog):
         self.entry.is_broken = broken
         self.entry.broken_reason = reason
         self.broken_label.setText(reason or "正常")
+
+    def _update_provider_info(self):
+        icon = self.entry.icon
+        if icon and not icon.isNull():
+            self.provider_icon.setPixmap(icon.pixmap(32, 32))
+        else:
+            self.provider_icon.setText("No Icon")
+        provider = self.handler_metadata.get("company") or self.handler_metadata.get("product") or "不明"
+        self.provider_label.setText(provider)
+        self.path_label.setText(self.handler_metadata.get("path") or "不明")
 
 
 class NewHandlerDialog(QDialog):
