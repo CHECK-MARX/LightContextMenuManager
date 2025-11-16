@@ -69,6 +69,9 @@ from PySide6.QtWidgets import (
     QMenu,
     QApplication,
     QDialogButtonBox,
+    QFrame,
+    QSplitter,
+    QScrollArea,
 )
 
 from ..audit import AuditLogger
@@ -133,12 +136,20 @@ class MainWindow(QMainWindow):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
         self.table.doubleClicked.connect(self._handle_row_double_click)
+        self.table.selectionModel().selectionChanged.connect(self._on_table_selection_changed)
         self._apply_simple_view_mode(self._simple_view_enabled)
         self.table.doubleClicked.connect(self._handle_row_double_click)
 
+        self._create_preview_panel()
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self.table)
+        splitter.addWidget(self.preview_panel)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+
         container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.addWidget(self.table)
+        layout = QHBoxLayout(container)
+        layout.addWidget(splitter)
         layout.setContentsMargins(0, 0, 0, 0)
         self.setCentralWidget(container)
 
@@ -193,7 +204,7 @@ class MainWindow(QMainWindow):
         self.toolbar.addAction(self.shell_filter_action)
 
         self.broken_filter_action = QAction("壊れている項目のみ", self, checkable=True)
-        self.broken_filter_action.toggled.connect(self.proxy.set_broken_only)
+        self.broken_filter_action.toggled.connect(self._on_broken_filter_toggled)
         self.toolbar.addAction(self.broken_filter_action)
         self.simple_view_action = QAction("シンプル表示(&S)", self, checkable=True)
         self.simple_view_action.setChecked(self._simple_view_enabled)
@@ -366,6 +377,7 @@ class MainWindow(QMainWindow):
             self.proxy.set_type_filter("shellex")
         elif not self.shell_filter_action.isChecked():
             self.proxy.set_type_filter(None)
+        self._refresh_preview()
 
     def _on_shell_filter_toggled(self, checked: bool):
         if checked:
@@ -375,10 +387,12 @@ class MainWindow(QMainWindow):
             self.proxy.set_type_filter("shell")
         elif not self.shellex_filter_action.isChecked():
             self.proxy.set_type_filter(None)
+        self._refresh_preview()
 
     def _on_scope_filter_changed(self, index: int):
         value = self.scope_combo.itemData(index)
         self.proxy.set_scope_filter(value)
+        self._refresh_preview()
 
     def _preset_selected(self, index: int):
         if index <= 0:
@@ -411,6 +425,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"{len(entries)} 件を読み込みました", 4000)
         self._apply_simple_view_mode(self._simple_view_enabled)
         self._update_safety_status()
+        self._refresh_preview()
 
     def _handle_table_click(self, index: QModelIndex):
         if index.column() != 0:
@@ -489,6 +504,108 @@ class MainWindow(QMainWindow):
             return None
         index = selection.selectedRows()[0]
         return self.model.entry_at(self.proxy.mapToSource(index).row())
+
+    def _create_preview_panel(self):
+        self.preview_panel = QWidget()
+        preview_layout = QVBoxLayout(self.preview_panel)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        preview_layout.setSpacing(6)
+        self.preview_header = QLabel("プレビュー")
+        preview_layout.addWidget(self.preview_header)
+        self.preview_items_widget = QWidget()
+        self.preview_items_layout = QVBoxLayout(self.preview_items_widget)
+        self.preview_items_layout.setContentsMargins(0, 0, 0, 0)
+        self.preview_items_layout.setSpacing(4)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.preview_items_widget)
+        preview_layout.addWidget(scroll)
+        self._preview_widgets: Dict[str, QWidget] = {}
+        self._current_preview_selection = None
+
+    def _refresh_preview(self):
+        if not hasattr(self, "preview_items_layout"):
+            return
+        self._clear_preview_items()
+        self.preview_header.setText(self._preview_header_text())
+        for row in range(self.proxy.rowCount()):
+            entry = self._entry_from_proxy_row(row)
+            if not entry:
+                continue
+            widget = self._create_preview_widget(entry)
+            self.preview_items_layout.addWidget(widget)
+            self._preview_widgets[entry.registry_path] = widget
+        self.preview_items_layout.addStretch()
+        self._update_preview_selection_highlight()
+
+    def _clear_preview_items(self):
+        while self.preview_items_layout.count():
+            item = self.preview_items_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self._preview_widgets.clear()
+
+    def _create_preview_widget(self, entry: HandlerEntry) -> QWidget:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setFrameShadow(QFrame.Raised)
+        frame.setProperty("registryPath", entry.registry_path)
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(8)
+        icon_label = QLabel()
+        icon_label.setFixedSize(20, 20)
+        if entry.icon:
+            icon_label.setPixmap(entry.icon.pixmap(20, 20))
+        layout.addWidget(icon_label)
+        text_layout = QVBoxLayout()
+        name_label = QLabel(entry.name)
+        if entry.is_broken:
+            name_label.setStyleSheet("color: #ff6b6b;")
+        elif not entry.enabled:
+            name_label.setStyleSheet("color: gray;")
+        text_layout.addWidget(name_label)
+        status_label = QLabel(entry.status)
+        status_label.setStyleSheet("font-size: 10px; color: gray;")
+        text_layout.addWidget(status_label)
+        layout.addLayout(text_layout)
+        return frame
+
+    def _update_preview_selection_highlight(self):
+        selected_path = self._current_preview_selection
+        for path, widget in self._preview_widgets.items():
+            if path == selected_path:
+                widget.setStyleSheet("background-color: #3c7ae5; color: white; border-radius: 4px;")
+            else:
+                widget.setStyleSheet("background-color: transparent;")
+
+    def _entry_from_proxy_row(self, row: int) -> Optional[HandlerEntry]:
+        index = self.proxy.index(row, HandlerTableModel.NAME_COLUMN)
+        if not index.isValid():
+            return None
+        source_index = self.proxy.mapToSource(index)
+        return self.model.entry_at(source_index.row())
+
+    def _preview_header_text(self) -> str:
+        scope = self.scope_combo.currentText() or "すべて"
+        types = []
+        if self.shellex_filter_action.isChecked():
+            types.append("ShellEx")
+        if self.shell_filter_action.isChecked():
+            types.append("shell/verb")
+        type_text = ", ".join(types) if types else "すべて"
+        return f"プレビュー (スコープ: {scope}, 種別: {type_text})"
+
+    def _on_broken_filter_toggled(self, checked: bool):
+        self.proxy.set_broken_only(checked)
+        self._refresh_preview()
+
+    def _on_table_selection_changed(self, *_args):
+        entry = self._selected_entry()
+        self._current_preview_selection = entry.registry_path if entry else None
+        self._update_preview_selection_highlight()
+
 
     def _show_context_menu(self, pos):
         index = self.table.indexAt(pos)
