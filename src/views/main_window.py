@@ -558,18 +558,10 @@ class MainWindow(QMainWindow):
         icon_label.setFixedSize(20, 20)
         if entry.icon:
             icon_label.setPixmap(entry.icon.pixmap(20, 20))
-        layout.addWidget(icon_label)
-        text_layout = QVBoxLayout()
+        layout.addWidget(icon_label, alignment=Qt.AlignVCenter)
         name_label = QLabel(entry.name)
-        if entry.is_broken:
-            name_label.setStyleSheet("color: #ff6b6b;")
-        elif not entry.enabled:
-            name_label.setStyleSheet("color: gray;")
-        text_layout.addWidget(name_label)
-        status_label = QLabel(entry.status)
-        status_label.setStyleSheet("font-size: 10px; color: gray;")
-        text_layout.addWidget(status_label)
-        layout.addLayout(text_layout)
+        name_label.setStyleSheet(f"color: {self._preview_text_color(entry)};")
+        layout.addWidget(name_label, alignment=Qt.AlignVCenter)
         return frame
 
     def _update_preview_selection_highlight(self):
@@ -589,13 +581,27 @@ class MainWindow(QMainWindow):
 
     def _preview_header_text(self) -> str:
         scope = self.scope_combo.currentText() or "すべて"
-        types = []
+        scope_map = {
+            "Directory Background": "背景",
+            "Folder": "フォルダー",
+            "Drive": "ドライブ",
+            "*": "すべて",
+        }
+        scope_text = scope_map.get(scope, scope)
         if self.shellex_filter_action.isChecked():
-            types.append("ShellEx")
-        if self.shell_filter_action.isChecked():
-            types.append("shell/verb")
-        type_text = ", ".join(types) if types else "すべて"
-        return f"プレビュー (スコープ: {scope}, 種別: {type_text})"
+            type_text = "拡張ハンドラー"
+        elif self.shell_filter_action.isChecked():
+            type_text = "メインメニュー"
+        else:
+            type_text = "すべて"
+        return f"プレビュー（スコープ: {scope_text}、種別: {type_text}）"
+
+    def _preview_text_color(self, entry: HandlerEntry) -> str:
+        if entry.is_broken:
+            return "#ff6b6b"
+        if not entry.enabled:
+            return "#888888"
+        return "#f0f0f0"
 
     def _on_broken_filter_toggled(self, checked: bool):
         self.proxy.set_broken_only(checked)
