@@ -6,6 +6,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import subprocess
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -27,6 +28,15 @@ LCM_QUARANTINE_SEG = "DisabledHandlers\\LcmQuarantine"
 LCM_ORIGINAL_PATH = "LCM_OriginalPath"
 LCM_TIMESTAMP = "LCM_Timestamp"
 LCM_VERSION = "LCM_Version"
+
+HKCU = winreg.HKEY_CURRENT_USER
+
+CUSTOM_SCOPE_PATHS: Dict[str, str] = {
+    "*": r"*\shell",
+    "Folder": r"Folder\shell",
+    "Directory Background": r"Directory\Background\shell",
+    "Drive": r"Drive\shell",
+}
 
 
 def export_to_reg(paths: Iterable[str], out_dir: Optional[Path] = None) -> Path:
@@ -236,7 +246,7 @@ class RegistryManager:
         except FileNotFoundError:
             return None
         status = "read-only" if read_only else ("enabled" if enabled else "disabled")
-        return HandlerEntry(
+        entry = HandlerEntry(
             name=display_name,
             type="shell" if handler_kind == "shell" else "shellex",
             key_name=key_name,
@@ -258,7 +268,11 @@ class RegistryManager:
             normalized_command=normalized_command,
             full_key_path=f"HKEY_CLASSES_ROOT\\{registry_path}",
             is_quarantined="LcmQuarantine" in registry_path,
-            )
+        )
+        broken, reason = self._evaluate_handler_integrity(entry, handler_kind)
+        entry.is_broken = broken
+        entry.broken_reason = reason
+        return entry
 
     # ------------------------------------------------------------------ #
     # Metadata helpers
@@ -307,6 +321,8 @@ class RegistryManager:
         icon, icon_path = self._icon_from_icon_value(icon_value)
         command_target = self._read_command_target(key_handle)
         target_path = icon_path or command_target
+        if not icon and command_target:
+            icon = self._icon_from_file(command_target)
         if not icon and not target_path and default_value:
             icon = self._icon_from_file(default_value)
             target_path = default_value
@@ -364,14 +380,10 @@ class RegistryManager:
         try:
             with winreg.OpenKey(HKCR, f"CLSID\\{clsid}", 0, READ_FLAGS) as clsid_key:
                 display_name = self._safe_query_value(clsid_key, None)
-                try:
-                    with winreg.OpenKey(clsid_key, "InprocServer32", 0, READ_FLAGS) as inproc_key:
-                        server_path = self._safe_query_value(inproc_key, None)
-                except FileNotFoundError:
-                    pass
         except FileNotFoundError:
             pass
-        expanded = self._expand_path(server_path)
+        server_path = self._clsid_server_path(clsid)
+        expanded = server_path
         if not display_name:
             display_name = self._file_product_name(expanded) or clsid or fallback
         return display_name or fallback, expanded
@@ -487,6 +499,113 @@ class RegistryManager:
         full_key = f"HKEY_CLASSES_ROOT\\{registry_path}"
         return f"実体: {target}\nキー: {full_key}\n状態: {status}"
 
+    # ------------------------------------------------------------------ #
+    # Broken handler detection (Step 1)
+    # ------------------------------------------------------------------ #
+    def _evaluate_handler_integrity(
+        self, entry: HandlerEntry, handler_kind: str
+    ) -> Tuple[bool, Optional[str]]:
+        try:
+            if handler_kind == "shell":
+                return self._check_shell_entry(entry)
+            return self._check_shellex_entry(entry)
+        except Exception:
+            self.logger.debug(
+                "Failed to evaluate handler integrity %s", entry.registry_path, exc_info=True
+            )
+            return False, None
+
+    def _check_shell_entry(self, entry: HandlerEntry) -> Tuple[bool, Optional[str]]:
+        executable = self._extract_command_executable(entry.command)
+        if executable:
+            if not Path(executable).is_file():
+                return True, "missing_exe"
+            return False, None
+        if entry.clsid:
+            server = self._clsid_server_path(entry.clsid)
+            if not server:
+                return True, "missing_clsid"
+            if not Path(server).is_file():
+                return True, "missing_exe"
+            return False, None
+        return True, "missing_guid"
+
+    def _check_shellex_entry(self, entry: HandlerEntry) -> Tuple[bool, Optional[str]]:
+        if entry.clsid:
+            server = self._clsid_server_path(entry.clsid)
+            if not server:
+                return True, "missing_clsid"
+            if not Path(server).is_file():
+                return True, "missing_exe"
+            return False, None
+        return True, "missing_guid"
+
+    def _extract_command_executable(self, command: Optional[str]) -> Optional[str]:
+        if not command:
+            return None
+        trimmed = command.strip()
+        if not trimmed:
+            return None
+        match = re.match(r'^"([^"]+)"', trimmed)
+        candidate = match.group(1) if match else trimmed.split(" ", 1)[0]
+        return self._expand_path(candidate)
+
+    def _clsid_server_path(self, clsid: Optional[str]) -> Optional[str]:
+        if not clsid:
+            return None
+        try:
+            with winreg.OpenKey(HKCR, f"CLSID\\{clsid}\\InprocServer32", 0, READ_FLAGS) as key:
+                value = self._safe_query_value(key, None)
+                if value:
+                    return self._expand_path(value)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        return None
+
+    def _slugify_handler_name(self, value: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", value.lower())
+        slug = slug.strip("-")
+        return slug or "custom"
+
+    def _ensure_hkcu_hierarchy(self, path: str):
+        if not path:
+            return
+        segments = path.split("\\")
+        current = []
+        for segment in segments:
+            current.append(segment)
+            try:
+                winreg.CreateKeyEx(HKCU, "\\".join(current), 0, WRITE_FLAGS).Close()
+            except OSError:
+                pass
+
+    def resolve_command_executable(self, command: Optional[str]) -> Optional[str]:
+        return self._extract_command_executable(command)
+
+    def update_display_name(self, entry: HandlerEntry, name: str):
+        if entry.read_only:
+            raise RegistryOperationError("This handler is read-only.")
+        try:
+            with winreg.OpenKey(HKCR, entry.registry_path, 0, WRITE_FLAGS) as key:
+                winreg.SetValueEx(key, None, 0, winreg.REG_SZ, name)
+        except OSError as exc:
+            raise RegistryOperationError(f"Failed to update display name: {exc}") from exc
+        entry.name = name
+
+    def update_command(self, entry: HandlerEntry, command: str):
+        if entry.read_only:
+            raise RegistryOperationError("This handler is read-only.")
+        command_key_path = f"{entry.registry_path}\\command"
+        try:
+            with winreg.CreateKeyEx(HKCR, command_key_path, 0, WRITE_FLAGS) as command_key:
+                winreg.SetValueEx(command_key, None, 0, winreg.REG_SZ, command)
+        except OSError as exc:
+            raise RegistryOperationError(f"Failed to update command: {exc}") from exc
+        entry.command = command
+        entry.normalized_command = self._normalize_command(command)
+        entry.target_path = self._extract_command_executable(command)
     def _normalize_text(self, value: str) -> str:
         return re.sub(r"\s+", " ", value or "").strip().lower()
 
@@ -501,6 +620,57 @@ class RegistryManager:
         base = parts[0]
         args = " ".join(parts[1:])
         return f"{base} {args}".strip()
+
+    def create_custom_handler(self, display_name: str, scope: str, exe_path: str) -> str:
+        if scope not in CUSTOM_SCOPE_PATHS:
+            raise RegistryOperationError(f"Unsupported scope: {scope}")
+        relative_base = CUSTOM_SCOPE_PATHS[scope]
+        slug = self._slugify_handler_name(display_name)
+        candidate = f"Lcm_{slug}"
+        count = 1
+        full_hkcu_path = ""
+        relative = ""
+        while True:
+            relative = f"{relative_base}\\{candidate}"
+            full_hkcu_path = f"HKEY_CURRENT_USER\\Software\\Classes\\{relative}"
+            if not _registry_key_exists(full_hkcu_path):
+                break
+            count += 1
+            candidate = f"Lcm_{slug}-{count}"
+        hkcu_relative = f"Software\\Classes\\{relative}"
+        parent = hkcu_relative.rsplit("\\", 1)[0]
+        self._ensure_hkcu_hierarchy(parent)
+        if _registry_key_exists(full_hkcu_path):
+            export_to_reg([full_hkcu_path])
+        command_line = f"\"{exe_path}\" \"%1\""
+        try:
+            with winreg.CreateKeyEx(HKCU, hkcu_relative, 0, WRITE_FLAGS) as key:
+                winreg.SetValueEx(key, None, 0, winreg.REG_SZ, display_name)
+                winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, exe_path)
+                with winreg.CreateKeyEx(key, "command", 0, WRITE_FLAGS) as cmd_key:
+                    winreg.SetValueEx(cmd_key, None, 0, winreg.REG_SZ, command_line)
+        except OSError as exc:
+            raise RegistryOperationError(f"Failed to create handler: {exc}") from exc
+        entry = HandlerEntry(
+            name=display_name,
+            type="verb",
+            scope=scope,
+            key_name=candidate,
+            registry_path=relative,
+            full_key_path=full_hkcu_path,
+            base_path=relative_base,
+            base_rel_path=relative_base,
+            enabled=True,
+            last_modified=datetime.now(timezone.utc),
+            last_write_time=datetime.now(timezone.utc),
+            status="enabled",
+            command=command_line,
+            normalized_name=self._normalize_text(display_name),
+            normalized_command=self._normalize_command(command_line),
+            tooltip=f"実体: {exe_path}\nキー: {full_hkcu_path}\n状態: enabled",
+        )
+        audit_append("create_custom", entry, exe_path, full_hkcu_path, True)
+        return full_hkcu_path
 
     def clsid_registry_path(self, entry: HandlerEntry) -> Optional[str]:
         clsid = entry.clsid

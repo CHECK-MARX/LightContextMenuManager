@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - optional dependency on some wheels
     _HAS_QTCONCURRENT = False
 
 from PySide6.QtCore import QModelIndex, Qt, QTimer, Slot
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
     QHeaderView,
@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QHBoxLayout,
     QVBoxLayout,
+    QFormLayout,
     QLabel,
     QPushButton,
     QRadioButton,
@@ -165,6 +166,10 @@ class MainWindow(QMainWindow):
         self.action_detect_duplicates.triggered.connect(self.on_detect_duplicates)
         self.toolbar.addAction(self.action_detect_duplicates)
 
+        self.new_handler_action = QAction("新規メニュー追加(&N)…", self)
+        self.new_handler_action.triggered.connect(self._add_new_handler)
+        self.toolbar.addAction(self.new_handler_action)
+
         self.favorite_filter_action = QAction("★のみ", self, checkable=True)
         self.favorite_filter_action.toggled.connect(self.proxy.set_favorites_only)
         self.toolbar.addAction(self.favorite_filter_action)
@@ -176,6 +181,10 @@ class MainWindow(QMainWindow):
         self.shell_filter_action = QAction("shell/verb", self, checkable=True)
         self.shell_filter_action.toggled.connect(self._on_shell_filter_toggled)
         self.toolbar.addAction(self.shell_filter_action)
+
+        self.broken_filter_action = QAction("壊れている項目のみ", self, checkable=True)
+        self.broken_filter_action.toggled.connect(self.proxy.set_broken_only)
+        self.toolbar.addAction(self.broken_filter_action)
 
         self.scope_combo = QComboBox(self)
         self.scope_combo.addItem("スコープ: すべて", None)
@@ -220,10 +229,6 @@ class MainWindow(QMainWindow):
         explorer_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
         explorer_action.triggered.connect(self.restart_explorer)
         self.toolbar.addAction(explorer_action)
-
-        self.action_detect_duplicates = QAction("重複を検出", self)
-        self.action_detect_duplicates.triggered.connect(self.on_detect_duplicates)
-        self.toolbar.addAction(self.action_detect_duplicates)
 
         theme_action = QAction("テーマ切替", self, checkable=True)
         theme_action.setChecked(True)
@@ -280,6 +285,28 @@ class MainWindow(QMainWindow):
             if ret == QMessageBox.Yes:
                 self.restart_explorer()
             self.refresh_entries()
+            self._prompt_restart_explorer()
+
+    def _prompt_restart_explorer(self):
+        ret = QMessageBox.question(
+            self,
+            "Explorer の再起動",
+            "変更を反映するには Explorer の再起動が必要です。再起動しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if ret == QMessageBox.Yes:
+            self.restart_explorer()
+
+    def _add_new_handler(self):
+        dialog = NewHandlerDialog(
+            registry=self.registry,
+            on_created=self.refresh_entries,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.Accepted:
+            self.status.showMessage("新しいメニューを作成しました。", 4000)
+            self._prompt_restart_explorer()
     def _sort_entries(self, entries: List[HandlerEntry]) -> List[HandlerEntry]:
         return sorted(
             entries,
@@ -414,6 +441,16 @@ class MainWindow(QMainWindow):
         menu = self._create_context_menu(entry)
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
+    def _show_handler_properties(self, entry: HandlerEntry):
+        dialog = HandlerPropertiesDialog(
+            entry=entry,
+            registry=self.registry,
+            parent=self,
+            toggle_callback=self._toggle_entry,
+            on_updated=self.refresh_entries,
+        )
+        dialog.exec()
+
     def _create_context_menu(self, entry: HandlerEntry) -> QMenu:
         menu = QMenu(self)
         fav_text = "★に追加" if not entry.is_favorite else "★を解除"
@@ -421,6 +458,9 @@ class MainWindow(QMainWindow):
         fav_action.setObjectName("context_toggle_favorite")
         fav_action.setData("context_toggle_favorite")
         fav_action.triggered.connect(lambda _, e=entry: self._toggle_favorite_entry(e))
+        properties_action = menu.addAction("詳細(&P)･･･")
+        properties_action.setObjectName("context_properties")
+        properties_action.triggered.connect(lambda _, e=entry: self._show_handler_properties(e))
         menu.addSeparator()
         edit_action = menu.addAction("編集…")
         edit_action.setObjectName("context_edit")
@@ -905,114 +945,6 @@ class PresetPreviewDialog(QDialog):
 class DuplicateDialog(QDialog):
     def __init__(self, groups: List[DuplicateGroup], registry: RegistryManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setWindowTitle("重複メニューの整理")
-        self.groups = groups
-        self.registry = registry
-        self._keep_indices: Dict[int, int] = {
-            idx: group.suggested_keep_index for idx, group in enumerate(groups)
-        }
-
-        self.lbl = QLabel(self._summary_text(), self)
-        self.tree = QTreeWidget(self)
-        self.tree.setColumnCount(6)
-        self.tree.setHeaderLabels(["保持", "名前", "種別", "スコープ", "コマンド/CLSID", "最終更新"])
-        self.tree.setRootIsDecorated(True)
-        self.tree.setUniformRowHeights(True)
-        self.tree.itemClicked.connect(self._on_item_clicked)
-        self._populate_tree()
-
-        btn_defaults = QPushButton("全て提案に戻す", self)
-        btn_defaults.clicked.connect(self._reset_to_suggested)
-        btn_ok = QPushButton("実行", self)
-        btn_cancel = QPushButton("キャンセル", self)
-        btn_ok.clicked.connect(self.accept)
-        btn_cancel.clicked.connect(self.reject)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.lbl)
-        layout.addWidget(self.tree)
-        bl = QHBoxLayout()
-        bl.addStretch(1)
-        bl.addWidget(btn_defaults)
-        bl.addWidget(btn_ok)
-        bl.addWidget(btn_cancel)
-        layout.addLayout(bl)
-        self.resize(960, 640)
-
-    def _summary_text(self) -> str:
-        total_groups = len(self.groups)
-        total_entries = sum(len(g.entries) for g in self.groups)
-        quarantine_plan = total_entries - total_groups
-        return f"重複グループ: {total_groups} / 隔離予定: {quarantine_plan}"
-
-    def _populate_tree(self):
-        self.tree.clear()
-        for gi, group in enumerate(self.groups):
-            root = QTreeWidgetItem(self.tree, [f"{group.reason.upper()} 重複", "", "", "", "", ""])
-            root.setFirstColumnSpanned(True)
-            root.setExpanded(True)
-            for ei, entry in enumerate(group.entries):
-                item = QTreeWidgetItem(root)
-                radio = QRadioButton()
-                radio.setChecked(ei == self._keep_indices[gi])
-                radio.toggled.connect(self._make_radio_handler(gi, ei))
-                w = QWidget()
-                hb = QHBoxLayout(w)
-                hb.setContentsMargins(6, 0, 0, 0)
-                hb.addWidget(radio)
-                hb.addStretch(1)
-                self.tree.setItemWidget(item, 0, w)
-
-                item.setText(1, entry.name)
-                item.setText(2, "shell/verb" if entry.type == "verb" else "ShellEx")
-                item.setText(3, entry.scope)
-                item.setText(4, entry.command or entry.clsid or "")
-                lw = entry.last_write_time.strftime("%Y-%m-%d %H:%M:%S") if entry.last_write_time else ""
-                item.setText(5, lw)
-                if ei != self._keep_indices[gi]:
-                    for col in range(1, 6):
-                        item.setForeground(col, Qt.gray)
-
-    def _make_radio_handler(self, gi: int, ei: int):
-        def handler(checked):
-            if checked:
-                self._keep_indices[gi] = ei
-                self._populate_tree()
-                self.lbl.setText(self._summary_text())
-
-        return handler
-
-    def _reset_to_suggested(self):
-        self._keep_indices = {
-            i: g.suggested_keep_index for i, g in enumerate(self.groups)
-        }
-        self._populate_tree()
-        self.lbl.setText(self._summary_text())
-
-    def run_quarantine_with_backup(self) -> Tuple[int, List[str]]:
-        to_quarantine: List[HandlerEntry] = []
-        for gi, group in enumerate(self.groups):
-            keep_idx = self._keep_indices.get(gi, group.suggested_keep_index)
-            for ei, entry in enumerate(group.entries):
-                if ei != keep_idx:
-                    to_quarantine.append(entry)
-        backup_paths = [entry.full_key_path for entry in to_quarantine]
-        if backup_paths:
-            export_to_reg(backup_paths)
-        quarantined = 0
-        errors: List[str] = []
-        for entry in to_quarantine:
-            try:
-                self.registry.quarantine_key(entry)
-                quarantined += 1
-            except Exception as ex:
-                errors.append(f"{entry.full_key_path}: {ex}")
-        return quarantined, errors
-
-
-class DuplicateDialog(QDialog):
-    def __init__(self, groups: List[DuplicateGroup], registry: RegistryManager, parent: Optional[QWidget] = None):
-        super().__init__(parent)
         self.setWindowTitle("重複検出")
         self.resize(900, 600)
         self.registry = registry
@@ -1099,3 +1031,234 @@ class DuplicateDialog(QDialog):
         logs_dir = Path(__file__).resolve().parent.parent / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         return logs_dir / f"duplicates_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.reg"
+
+
+class HandlerPropertiesDialog(QDialog):
+    def __init__(
+        self,
+        entry: HandlerEntry,
+        registry: RegistryManager,
+        toggle_callback: Callable[[HandlerEntry, bool, bool], None],
+        on_updated: Callable[[], None],
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.entry = entry
+        self.registry = registry
+        self.toggle_callback = toggle_callback
+        self.on_updated = on_updated
+        self.setWindowTitle(f"詳細: {entry.name}")
+        self.resize(580, 360)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit(entry.name)
+        form.addRow("表示名", self.name_edit)
+        self.type_label = QLabel("ShellEx" if entry.type == "shellex" else "shell/verb")
+        form.addRow("種別", self.type_label)
+        self.scope_label = QLabel(entry.scope)
+        form.addRow("スコープ", self.scope_label)
+
+        command_widget = QWidget()
+        command_layout = QHBoxLayout(command_widget)
+        command_layout.setContentsMargins(0, 0, 0, 0)
+        self.command_edit = QLineEdit(entry.command or entry.clsid or "")
+        self.command_edit.setReadOnly(entry.type != "verb")
+        command_layout.addWidget(self.command_edit)
+        self.command_widget = command_widget
+        form.addRow("コマンド / CLSID", command_widget)
+
+        path_widget = QWidget()
+        path_layout = QHBoxLayout(path_widget)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        self.registry_path_edit = QLineEdit(entry.full_key_path)
+        self.registry_path_edit.setReadOnly(True)
+        path_layout.addWidget(self.registry_path_edit)
+        copy_button = QPushButton("コピー")
+        copy_button.clicked.connect(self._copy_registry_path)
+        path_layout.addWidget(copy_button)
+        form.addRow("レジストリパス", path_widget)
+
+        icon_layout = QHBoxLayout()
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(64, 64)
+        self.icon_label.setAlignment(Qt.AlignCenter)
+        icon_layout.addWidget(self.icon_label)
+        form.addRow("アイコン", icon_layout)
+        self._update_icon_preview()
+
+        self.broken_label = QLabel(entry.broken_reason or "正常")
+        form.addRow("状態", self.broken_label)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        test_btn = QPushButton("テスト実行")
+        test_btn.clicked.connect(self._test_command)
+        btn_layout.addWidget(test_btn)
+        repair_btn = QPushButton("修復...")
+        repair_btn.clicked.connect(self._repair_command)
+        btn_layout.addWidget(repair_btn)
+        self.disable_btn = QPushButton("無効化" if entry.enabled else "有効化")
+        self.disable_btn.clicked.connect(self._toggle_entry_state)
+        btn_layout.addWidget(self.disable_btn)
+        close_btn = QPushButton("閉じる")
+        close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(close_btn)
+
+        container = QWidget(self)
+        layout = QVBoxLayout(container)
+        layout.addLayout(form)
+        layout.addLayout(btn_layout)
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.setLayout(layout)
+
+    def _update_icon_preview(self):
+        if self.entry.icon and not self.entry.icon.isNull():
+            pixmap = self.entry.icon.pixmap(64, 64)
+            self.icon_label.setPixmap(pixmap)
+        else:
+            self.icon_label.setText("アイコンなし")
+
+    def _copy_registry_path(self):
+        QApplication.clipboard().setText(self.entry.full_key_path)
+        QMessageBox.information(self, "コピー完了", "レジストリパスをコピーしました。")
+
+    def _test_command(self):
+        command = self.command_edit.text().strip()
+        exe = self.registry.resolve_command_executable(command)
+        if not exe:
+            QMessageBox.warning(self, "テスト実行", "実行コマンドが設定されていません。")
+            return
+        if not Path(exe).exists():
+            QMessageBox.warning(self, "テスト実行", f"{exe} が存在しません。")
+            return
+        try:
+            subprocess.Popen([exe], cwd=os.path.dirname(exe) or None)
+            QMessageBox.information(self, "テスト実行", "アプリケーションを起動しました。")
+        except Exception as exc:
+            QMessageBox.warning(self, "テスト実行", f"起動に失敗しました: {exc}")
+
+    def _repair_command(self):
+        if self.entry.read_only:
+            QMessageBox.warning(self, "修復", "読み取り専用のエントリは修復できません。")
+            return
+        exe_path, _ = QFileDialog.getOpenFileName(
+            self, "実行ファイルを選択", "", "実行ファイル (*.exe)"
+        )
+        if not exe_path:
+            return
+        command = f"\"{exe_path}\" \"%1\""
+        try:
+            export_to_reg([self.entry.full_key_path])
+            name = self.name_edit.text().strip()
+            if name:
+                self.registry.update_display_name(self.entry, name)
+            self.registry.update_command(self.entry, command)
+            new_icon = self.registry._icon_from_file(exe_path)
+            if new_icon:
+        self.entry.icon = new_icon
+        except Exception as exc:
+            QMessageBox.critical(self, "修復", f"書き換えに失敗しました: {exc}")
+            return
+        self.command_edit.setText(command)
+        self._update_icon_preview()
+        self._refresh_broken_state()
+        QMessageBox.information(self, "修復", "コマンドを書き換えました。")
+        self.on_updated()
+
+    def _toggle_entry_state(self):
+        if self.entry.read_only:
+            QMessageBox.warning(self, "状態変更", "読み取り専用のエントリは変更できません。")
+            return
+        desired = not self.entry.enabled
+        self.toggle_callback(self.entry, desired, True)
+        self.on_updated()
+        self.close()
+
+    def _refresh_broken_state(self):
+        broken, reason = self.registry._evaluate_handler_integrity(
+            self.entry, self.entry.type
+        )
+        self.entry.is_broken = broken
+        self.entry.broken_reason = reason
+        self.broken_label.setText(reason or "正常")
+
+
+class NewHandlerDialog(QDialog):
+    SCOPE_CHOICES = [
+        ("*", "すべて"),
+        ("Folder", "フォルダ"),
+        ("Directory Background", "ディレクトリ背景"),
+        ("Drive", "ドライブ"),
+    ]
+
+    def __init__(
+        self,
+        *,
+        registry: RegistryManager,
+        on_created: Callable[[], None],
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.registry = registry
+        self.on_created = on_created
+        self.setWindowTitle("新規メニュー追加")
+        self.resize(520, 240)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit()
+        form.addRow("表示名", self.name_edit)
+
+        self.scope_combo = QComboBox()
+        for key, label in self.SCOPE_CHOICES:
+            self.scope_combo.addItem(label, key)
+        form.addRow("スコープ", self.scope_combo)
+
+        exe_widget = QWidget()
+        exe_layout = QHBoxLayout(exe_widget)
+        exe_layout.setContentsMargins(0, 0, 0, 0)
+        self.exe_edit = QLineEdit()
+        exe_layout.addWidget(self.exe_edit)
+        browse_btn = QPushButton("参照")
+        browse_btn.clicked.connect(self._choose_executable)
+        exe_layout.addWidget(browse_btn)
+        form.addRow("実行ファイル", exe_widget)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        create_btn = QPushButton("追加")
+        create_btn.clicked.connect(self._on_create)
+        buttons.addWidget(create_btn)
+        cancel_btn = QPushButton("キャンセル")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(cancel_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addLayout(buttons)
+
+    def _choose_executable(self):
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "実行ファイルを選択", "", "実行ファイル (*.exe)"
+        )
+        if file_name:
+            self.exe_edit.setText(file_name)
+
+    def _on_create(self):
+        display = self.name_edit.text().strip()
+        exe_path = self.exe_edit.text().strip()
+        scope = self.scope_combo.currentData()
+        if not display or not exe_path:
+            QMessageBox.warning(self, "入力不足", "表示名と実行ファイルは必須です。")
+            return
+        try:
+            handler_path = self.registry.create_custom_handler(display, scope, exe_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "新規メニュー追加", f"作成に失敗しました: {exc}")
+            return
+        QMessageBox.information(
+            self,
+            "新規メニュー追加",
+            f"{display} を {handler_path} に作成しました。HKCU のキーをご確認ください。",
+        )
+        self.on_created()
+        super().accept()
