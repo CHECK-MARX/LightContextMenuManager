@@ -93,10 +93,11 @@ class HandlerTableModel(QAbstractTableModel):
             if column == 3:
                 return entry.base_path
             if column == 4:
-                status = entry.status
                 if entry.is_broken:
-                    status = "broken" if entry.enabled else "broken (disabled)"
-                return status
+                    return "問題あり（無効）" if not entry.enabled else "問題あり"
+                if entry.read_only:
+                    return "参照のみ"
+                return "有効" if entry.enabled else "無効"
             if column == 5:
                 return entry.registry_path
             if column == 6:

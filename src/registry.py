@@ -1212,6 +1212,13 @@ def restore_quarantined(entry: HandlerEntry) -> str:
         self.move_key(path, dest)
         return dest
 
+    # ------------------------------------------------------------------ #
+    # Shell helper
+    # ------------------------------------------------------------------ #
+    def restart_explorer(self):
+        subprocess.run(["taskkill", "/IM", "explorer.exe", "/F"], check=False)
+        subprocess.Popen(["explorer.exe"])
+
 def audit_append(
     action: str,
     entry: HandlerEntry,
@@ -1264,9 +1271,3 @@ def audit_append(
     except Exception:
         logging.getLogger(__name__).debug("Failed to append audit log", exc_info=True)
 
-    # ------------------------------------------------------------------ #
-    # Shell helper
-    # ------------------------------------------------------------------ #
-    def restart_explorer(self):
-        subprocess.run(["taskkill", "/IM", "explorer.exe", "/F"], check=False)
-        subprocess.Popen(["explorer.exe"])

@@ -148,9 +148,15 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
 
         container = QWidget()
-        layout = QHBoxLayout(container)
-        layout.addWidget(splitter)
+        layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.help_banner = QLabel(
+            "使い方：項目を選び、左端のチェックを切り替えます。\n"
+            "有効＝右クリックメニューに表示、無効＝表示しない。迷った場合は変更前にバックアップしてください。"
+        )
+        self.help_banner.setWordWrap(True)
+        layout.addWidget(self.help_banner)
+        layout.addWidget(splitter)
         self.setCentralWidget(container)
 
         self.toolbar = QToolBar("ツールバー", self)
@@ -183,33 +189,56 @@ class MainWindow(QMainWindow):
         self.search_field.textChanged.connect(self.proxy.set_keyword)
         self.toolbar.addWidget(self.search_field)
 
+        help_action = QAction("使い方", self)
+        help_action.triggered.connect(self._show_beginner_help)
+        self.toolbar.addAction(help_action)
+
+        self.toggle_selected_action = QAction("選択項目を有効／無効", self)
+        self.toggle_selected_action.setToolTip("一覧で選択した項目を右クリックメニューに表示／非表示にします")
+        self.toggle_selected_action.triggered.connect(self._toggle_selected_entry)
+        self.toolbar.addAction(self.toggle_selected_action)
+        self.toolbar.addSeparator()
+
+        self._advanced_actions = []
+
         self.action_detect_duplicates = QAction("重複を検出", self)
         self.action_detect_duplicates.triggered.connect(self.on_detect_duplicates)
         self.toolbar.addAction(self.action_detect_duplicates)
+        self._advanced_actions.append(self.action_detect_duplicates)
 
         self.new_handler_action = QAction("新規メニュー追加(&N)…", self)
         self.new_handler_action.triggered.connect(self._add_new_handler)
         self.toolbar.addAction(self.new_handler_action)
+        self._advanced_actions.append(self.new_handler_action)
 
         self.favorite_filter_action = QAction("★のみ", self, checkable=True)
         self.favorite_filter_action.toggled.connect(self.proxy.set_favorites_only)
         self.toolbar.addAction(self.favorite_filter_action)
+        self._advanced_actions.append(self.favorite_filter_action)
 
         self.shellex_filter_action = QAction("ShellEx", self, checkable=True)
         self.shellex_filter_action.toggled.connect(self._on_shellex_filter_toggled)
         self.toolbar.addAction(self.shellex_filter_action)
+        self._advanced_actions.append(self.shellex_filter_action)
 
         self.shell_filter_action = QAction("shell/verb", self, checkable=True)
         self.shell_filter_action.toggled.connect(self._on_shell_filter_toggled)
         self.toolbar.addAction(self.shell_filter_action)
+        self._advanced_actions.append(self.shell_filter_action)
 
         self.broken_filter_action = QAction("壊れている項目のみ", self, checkable=True)
         self.broken_filter_action.toggled.connect(self._on_broken_filter_toggled)
         self.toolbar.addAction(self.broken_filter_action)
+        self._advanced_actions.append(self.broken_filter_action)
         self.simple_view_action = QAction("シンプル表示(&S)", self, checkable=True)
         self.simple_view_action.setChecked(self._simple_view_enabled)
         self.simple_view_action.toggled.connect(self._on_simple_view_toggled)
         self.toolbar.addAction(self.simple_view_action)
+
+        self.advanced_mode_action = QAction("詳細設定を表示", self, checkable=True)
+        self.advanced_mode_action.setToolTip("重複検出、プリセット、バックアップなどの機能を表示します")
+        self.advanced_mode_action.toggled.connect(self._toggle_advanced_mode)
+        self.toolbar.addAction(self.advanced_mode_action)
 
         self.scope_combo = QComboBox(self)
         self.scope_combo.addItem("スコープ: すべて", None)
@@ -236,33 +265,40 @@ class MainWindow(QMainWindow):
         backup_action = QAction("バックアップ(.reg)", self)
         backup_action.triggered.connect(self.backup_entries)
         self.toolbar.addAction(backup_action)
+        self._advanced_actions.append(backup_action)
 
         restore_action = QAction("復元(.reg)", self)
         restore_action.triggered.connect(self.restore_from_file)
         self.toolbar.addAction(restore_action)
+        self._advanced_actions.append(restore_action)
 
         csv_action = QAction("CSV出力", self)
         csv_action.triggered.connect(self.export_csv)
         self.toolbar.addAction(csv_action)
+        self._advanced_actions.append(csv_action)
 
         self.preset_combo = QComboBox(self)
         self._populate_preset_combo()
         self.preset_combo.currentIndexChanged.connect(self._preset_selected)
         self.toolbar.addWidget(self.preset_combo)
+        self._advanced_actions.append(self.preset_combo)
 
         explorer_action = QAction("Explorer再起動", self)
         explorer_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
         explorer_action.triggered.connect(self.restart_explorer)
         self.toolbar.addAction(explorer_action)
+        self._advanced_actions.append(explorer_action)
 
         theme_action = QAction("テーマ切替", self, checkable=True)
         theme_action.setChecked(True)
         theme_action.triggered.connect(self.toggle_theme)
         self.toolbar.addAction(theme_action)
+        self._advanced_actions.append(theme_action)
 
         audit_action = QAction("監査フォルダを開く", self)
         audit_action.triggered.connect(self.open_audit_folder)
         self.toolbar.addAction(audit_action)
+        self._advanced_actions.append(audit_action)
 
         edit_action = QAction("編集", self)
         edit_action.setShortcut(QKeySequence("Ctrl+Return"))
@@ -273,6 +309,34 @@ class MainWindow(QMainWindow):
         open_registry_action.setShortcut(QKeySequence("Ctrl+R"))
         open_registry_action.triggered.connect(self._open_selected_registry)
         self.addAction(open_registry_action)
+
+        self._toggle_advanced_mode(False)
+
+    def _toggle_advanced_mode(self, enabled: bool):
+        """Show or hide operations intended for experienced users."""
+        for item in getattr(self, "_advanced_actions", []):
+            item.setVisible(enabled)
+        self.advanced_mode_action.setText("詳細設定を隠す" if enabled else "詳細設定を表示")
+        if hasattr(self, "help_banner"):
+            self.help_banner.setText(
+                "詳細設定を表示中です。高度な操作は、内容を確認してから実行してください。"
+                if enabled else
+                "使い方：項目を選び、左端のチェックを切り替えます。\n"
+                "有効＝右クリックメニューに表示、無効＝表示しない。迷った場合は変更前にバックアップしてください。"
+            )
+
+    def _show_beginner_help(self):
+        QMessageBox.information(
+            self,
+            "このアプリの使い方",
+            "右クリックメニューの項目を整理するアプリです。\n\n"
+            "1. 検索欄で項目を探します。\n"
+            "2. 行を選び、左端のチェックを切り替えます。\n"
+            "   有効：右クリックメニューに表示します\n"
+            "   無効：右クリックメニューから隠します\n"
+            "3. 変更後、必要に応じてExplorerを再起動します。\n\n"
+            "赤字の「問題あり」は、関連するプログラムが見つからない可能性があります。"
+        )
 
     def _populate_preset_combo(self):
         self.preset_combo.clear()
