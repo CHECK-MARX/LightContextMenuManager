@@ -65,11 +65,13 @@ def main():
             history=history,
             history_path=history_path,
             presets=presets,
-             audit_logger=audit_logger,
-             audit_path=base_dir / "audit",
+            audit_logger=audit_logger,
+            audit_path=base_dir / "audit",
+            settings=settings,
             logger=logger,
         )
         window.show()
+        window.maybe_show_onboarding()
     except Exception:
         logger.exception("Failed to start UI")
         QMessageBox.critical(None, "致命的なエラー", "アプリケーションを起動できませんでした。ログを確認してください。")
