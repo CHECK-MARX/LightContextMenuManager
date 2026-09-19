@@ -72,11 +72,13 @@ from PySide6.QtWidgets import (
     QFrame,
     QSplitter,
     QScrollArea,
+    QSizePolicy,
 )
 
 from ..audit import AuditLogger
 from ..history import HistoryEntry, HistoryManager
 from ..models import HandlerEntry, HandlerFilterProxyModel, HandlerTableModel
+from ..native_menu import NativeMenuUnavailable, show_context_menu
 from ..presets import Preset, PresetManager
 from ..registry import DuplicateGroup, RegistryManager, export_to_reg, group_duplicates
 
@@ -150,13 +152,18 @@ class MainWindow(QMainWindow):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         self.help_banner = QLabel(
             "使い方：項目を選び、左端のチェックを切り替えます。\n"
             "有効＝右クリックメニューに表示、無効＝表示しない。迷った場合は変更前にバックアップしてください。"
         )
         self.help_banner.setWordWrap(True)
+        self.help_banner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.help_banner)
-        layout.addWidget(splitter)
+        layout.addWidget(splitter, 1)
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 1)
+        splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCentralWidget(container)
 
         self.toolbar = QToolBar("ツールバー", self)
@@ -556,6 +563,53 @@ class MainWindow(QMainWindow):
             return
         self._toggle_entry(entry, not entry.enabled, record_history=True)
 
+    def _edit_selected_entry(self):
+        entry = self._selected_entry()
+        if not entry:
+            return
+        self._show_handler_properties(entry)
+
+    def _remove_selected_entry(self):
+        """Back up and quarantine an item instead of deleting it permanently."""
+        entry = self._selected_entry()
+        if not entry:
+            return
+        if entry.read_only:
+            QMessageBox.information(self, "削除できません", "この項目は参照のみです。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "メニュー項目を削除",
+            f"「{entry.name}」を右クリックメニューから削除しますか？\n\n"
+            "完全削除はせず、バックアップを作成して隔離します。後から復元できます。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        backup_path = Path(__file__).resolve().parent.parent / "logs" / (
+            f"removed_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.reg"
+        )
+
+        def worker():
+            self.registry.export_to_reg([entry], backup_path)
+            return self.registry.quarantine_key(entry)
+
+        def after(_destination):
+            self.status.showMessage(
+                f"{entry.name} を安全に隔離しました。バックアップ: {backup_path.name}", 6000
+            )
+            self.refresh_entries()
+            self._prompt_restart_explorer()
+
+        self._run_in_background(
+            "バックアップを作成してメニュー項目を隔離中...",
+            worker,
+            after,
+            audit_records=[{"action": "remove", "item_name": entry.name, "scope": entry.scope}],
+        )
+
     def _open_selected_registry(self):
         entry = self._selected_entry()
         if not entry:
@@ -569,13 +623,38 @@ class MainWindow(QMainWindow):
         index = selection.selectedRows()[0]
         return self.model.entry_at(self.proxy.mapToSource(index).row())
 
+    def _select_preview_entry(self, registry_path: str):
+        for row in range(self.proxy.rowCount()):
+            entry = self._entry_from_proxy_row(row)
+            if entry and entry.registry_path == registry_path:
+                self.table.selectRow(row)
+                self.table.setCurrentIndex(self.proxy.index(row, HandlerTableModel.NAME_COLUMN))
+                self._update_preview_actions()
+                return
+
     def _create_preview_panel(self):
         self.preview_panel = QWidget()
         preview_layout = QVBoxLayout(self.preview_panel)
         preview_layout.setContentsMargins(8, 8, 8, 8)
         preview_layout.setSpacing(6)
-        self.preview_header = QLabel("プレビュー")
+        self.preview_header = QLabel("右クリックメニュー プレビュー")
+        self.preview_header.setStyleSheet("font-size: 15px; font-weight: bold;")
         preview_layout.addWidget(self.preview_header)
+        self.preview_hint = QLabel(
+            "インストールしたアプリが追加した右クリック項目を表示しています。"
+            "Windows標準の項目（開く・コピー・削除など）は対象外です。"
+        )
+        self.preview_hint.setWordWrap(True)
+        preview_layout.addWidget(self.preview_hint)
+        self.preview_inactive_check = QCheckBox("無効・問題ありの項目も表示")
+        self.preview_inactive_check.setToolTip(
+            "現在の右クリックメニューに表示されない項目も、確認・復元・削除できます。"
+        )
+        self.preview_inactive_check.toggled.connect(lambda _checked: self._refresh_preview())
+        preview_layout.addWidget(self.preview_inactive_check)
+        self.preview_detail = QLabel("項目を選択すると、実体と状態を表示します。")
+        self.preview_detail.setWordWrap(True)
+        preview_layout.addWidget(self.preview_detail)
         self.preview_items_widget = QWidget()
         self.preview_items_layout = QVBoxLayout(self.preview_items_widget)
         self.preview_items_layout.setContentsMargins(0, 0, 0, 0)
@@ -584,22 +663,54 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.preview_items_widget)
         preview_layout.addWidget(scroll)
+
+        action_layout = QHBoxLayout()
+        self.preview_edit_button = QPushButton("編集")
+        self.preview_edit_button.clicked.connect(self._edit_selected_entry)
+        action_layout.addWidget(self.preview_edit_button)
+        self.preview_diagnose_button = QPushButton("詳細診断")
+        self.preview_diagnose_button.clicked.connect(self._diagnose_selected_entry)
+        action_layout.addWidget(self.preview_diagnose_button)
+        self.preview_toggle_button = QPushButton("無効化")
+        self.preview_toggle_button.clicked.connect(self._toggle_selected_entry)
+        action_layout.addWidget(self.preview_toggle_button)
+        self.preview_remove_button = QPushButton("安全に削除")
+        self.preview_remove_button.setToolTip("バックアップを作成してから隔離します。元に戻せます。")
+        self.preview_remove_button.clicked.connect(self._remove_selected_entry)
+        action_layout.addWidget(self.preview_remove_button)
+        self.preview_add_button = QPushButton("項目を追加")
+        self.preview_add_button.clicked.connect(self._add_new_handler)
+        action_layout.addWidget(self.preview_add_button)
+        self.native_preview_button = QPushButton("実際のメニューを表示")
+        self.native_preview_button.setToolTip(
+            "対象ファイルを選ぶと、Windowsが実際に表示するメニューを確認できます。操作は実行されません。"
+        )
+        self.native_preview_button.clicked.connect(self._show_native_menu_preview)
+        action_layout.addWidget(self.native_preview_button)
+        preview_layout.addLayout(action_layout)
         self._preview_widgets: Dict[str, QWidget] = {}
         self._current_preview_selection = None
+        self._update_preview_actions()
 
     def _refresh_preview(self):
         if not hasattr(self, "preview_items_layout"):
             return
         self._clear_preview_items()
         self.preview_header.setText(self._preview_header_text())
+        shown = 0
         for row in range(self.proxy.rowCount()):
             entry = self._entry_from_proxy_row(row)
             if not entry:
                 continue
+            if not self.preview_inactive_check.isChecked() and (not entry.enabled or entry.is_broken):
+                continue
             widget = self._create_preview_widget(entry)
             self.preview_items_layout.addWidget(widget)
             self._preview_widgets[entry.registry_path] = widget
+            shown += 1
         self.preview_items_layout.addStretch()
+        suffix = "（表示中の項目）" if not self.preview_inactive_check.isChecked() else "（無効・問題ありを含む）"
+        self.preview_header.setText(f"右クリックメニュー プレビュー: {shown}件 {suffix}")
         self._update_preview_selection_highlight()
 
     def _clear_preview_items(self):
@@ -611,7 +722,10 @@ class MainWindow(QMainWindow):
         self._preview_widgets.clear()
 
     def _create_preview_widget(self, entry: HandlerEntry) -> QWidget:
-        row = QWidget()
+        row = QPushButton()
+        row.setFlat(True)
+        row.setCursor(Qt.PointingHandCursor)
+        row.clicked.connect(lambda path=entry.registry_path: self._select_preview_entry(path))
         layout = QHBoxLayout(row)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(8)
@@ -630,8 +744,91 @@ class MainWindow(QMainWindow):
         text_label.setStyleSheet(f"color: {color};")
         layout.addWidget(text_label, alignment=Qt.AlignVCenter)
 
+        if not entry.enabled:
+            text_label.setText(f"{entry.name}  (無効)")
+        elif entry.is_broken:
+            text_label.setText(f"{entry.name}  (問題あり)")
+
         row.setProperty("registryPath", entry.registry_path)
         return row
+
+    def _update_preview_actions(self):
+        if not hasattr(self, "preview_edit_button"):
+            return
+        entry = self._selected_entry()
+        editable = bool(entry and not entry.read_only)
+        self.preview_diagnose_button.setEnabled(entry is not None)
+        self.preview_edit_button.setEnabled(editable)
+        self.preview_toggle_button.setEnabled(editable)
+        self.preview_remove_button.setEnabled(editable)
+        if entry:
+            self.preview_toggle_button.setText("無効化" if entry.enabled else "有効化")
+            state = "問題あり" if entry.is_broken else ("有効" if entry.enabled else "無効")
+            reason = entry.broken_reason or "問題は検出されていません"
+            target = entry.target_path or entry.command or entry.clsid or "実体情報なし"
+            self.preview_detail.setText(
+                f"状態: {state}　|　種別: {'ShellEx' if entry.type == 'shellex' else '通常メニュー'}\n"
+                f"実体: {target}\n判定: {reason}"
+            )
+        else:
+            self.preview_toggle_button.setText("有効／無効")
+            self.preview_detail.setText("項目を選択すると、実体と状態を表示します。")
+
+    def _diagnose_selected_entry(self):
+        entry = self._selected_entry()
+        if not entry:
+            return
+        info = self.registry.diagnose_handler(entry)
+        lines = [
+            f"表示名: {info['name']}",
+            f"所属: {info['scope']} / {info['kind']}",
+            f"現在の状態: {info['enabled']}",
+            f"メニュー表示: {info['appearance']}",
+            f"問題判定: {info['reason']}",
+            "",
+            f"実体: {info['target']}",
+            f"実体の確認: {info['target_exists']}",
+            f"CLSID: {info['clsid']}",
+            f"CLSID登録: {info['registration']}",
+            f"CLSIDパス: {info['clsid_path']}",
+            f"登録先: {info['registry_path']}",
+        ]
+        QMessageBox.information(self, "メニュー項目の詳細診断", "\n".join(lines))
+
+    def _show_native_menu_preview(self):
+        """Show the real Windows context menu without executing a command."""
+        target, _ = QFileDialog.getOpenFileName(
+            self,
+            "右クリックメニューを確認するファイルを選択",
+            "",
+            "すべてのファイル (*.*)",
+        )
+        if not target:
+            return
+        try:
+            point = self.native_preview_button.mapToGlobal(
+                self.native_preview_button.rect().bottomLeft()
+            )
+            selected = show_context_menu(
+                target,
+                int(self.winId()),
+                point.x(),
+                point.y(),
+            )
+        except NativeMenuUnavailable as exc:
+            QMessageBox.warning(self, "実際のメニューを表示できません", str(exc))
+            return
+        except Exception as exc:
+            self.logger.exception("Failed to show native context menu")
+            QMessageBox.warning(self, "実際のメニューを表示できません", str(exc))
+            return
+        if selected:
+            QMessageBox.information(
+                self,
+                "プレビュー完了",
+                "Windowsの実際の右クリックメニューを表示しました。\n"
+                "安全のため、選択されたメニュー操作は実行していません。",
+            )
 
     def _update_preview_selection_highlight(self):
         selected_path = self._current_preview_selection
@@ -680,6 +877,7 @@ class MainWindow(QMainWindow):
         entry = self._selected_entry()
         self._current_preview_selection = entry.registry_path if entry else None
         self._update_preview_selection_highlight()
+        self._update_preview_actions()
 
 
     def _show_context_menu(self, pos):
@@ -1313,7 +1511,7 @@ class HandlerPropertiesDialog(QDialog):
         command_layout = QHBoxLayout(command_widget)
         command_layout.setContentsMargins(0, 0, 0, 0)
         self.command_edit = QLineEdit(entry.command or entry.clsid or "")
-        self.command_edit.setReadOnly(entry.type != "verb")
+        self.command_edit.setReadOnly(entry.type == "shellex")
         command_layout.addWidget(self.command_edit)
         self.command_widget = command_widget
         form.addRow("コマンド / CLSID", command_widget)
@@ -1357,6 +1555,10 @@ class HandlerPropertiesDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
+        save_btn = QPushButton("変更を保存")
+        save_btn.setEnabled(not entry.read_only)
+        save_btn.clicked.connect(self._save_changes)
+        btn_layout.addWidget(save_btn)
         test_btn = QPushButton("テスト実行")
         test_btn.clicked.connect(self._test_command)
         btn_layout.addWidget(test_btn)
@@ -1376,6 +1578,25 @@ class HandlerPropertiesDialog(QDialog):
         layout.addLayout(btn_layout)
         layout.setContentsMargins(12, 12, 12, 12)
         self.setLayout(layout)
+
+    def _save_changes(self):
+        if self.entry.read_only:
+            return
+        try:
+            new_name = self.name_edit.text().strip()
+            if not new_name:
+                QMessageBox.warning(self, "入力エラー", "表示名を入力してください。")
+                return
+            if new_name != self.entry.name:
+                self.registry.update_display_name(self.entry, new_name)
+            if self.entry.type == "shell":
+                new_command = self.command_edit.text().strip()
+                if new_command != (self.entry.command or ""):
+                    self.registry.update_command(self.entry, new_command)
+            self.on_updated()
+            QMessageBox.information(self, "保存完了", "メニュー項目の変更を保存しました。")
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失敗", f"変更を保存できませんでした。\n{exc}")
 
     def _update_icon_preview(self):
         if self.entry.icon and not self.entry.icon.isNull():

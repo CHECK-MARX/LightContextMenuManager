@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import winreg
+from PySide6.QtCore import QFileInfo
 from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtWidgets import QFileIconProvider
 
 from .models import HandlerEntry
 
@@ -128,7 +130,10 @@ class RegistryManager:
         for target in SHELLEX_TARGETS:
             entries.extend(self._read_scope(target, read_only=False))
         for target in SHELL_TARGETS:
-            entries.extend(self._read_scope(target, read_only=True))
+            # These are the visible text commands in the Windows menu. They
+            # are editable too; every mutation is performed through the same
+            # backup/undo path as ShellEx entries.
+            entries.extend(self._read_scope(target, read_only=False))
         return sorted(entries, key=lambda item: (item.scope, item.name.lower()))
 
     def _read_scope(self, descriptor: dict, read_only: bool) -> List[HandlerEntry]:
@@ -180,6 +185,12 @@ class RegistryManager:
                     except OSError:
                         break
                     index += 1
+                    # These are manager-owned containers, not user-facing
+                    # context-menu commands.
+                    if key_name.lower() == "lcmquarantine":
+                        continue
+                    if key_name.lower() == "disabledhandlers" and not parent_path.lower().endswith("\\disabledhandlers"):
+                        continue
                     registry_path = f"{parent_path}\\{key_name}"
                     entry = self._build_entry(
                         registry_path=registry_path,
@@ -422,6 +433,13 @@ class RegistryManager:
         if cache_key in self._icon_cache:
             return self._icon_cache[cache_key]
         try:
+            # QFileIconProvider delegates icon lookup to the Windows Shell and
+            # works with PySide6, where QPixmap.fromWinHICON is unavailable.
+            provider_icon = QFileIconProvider().icon(QFileInfo(expanded))
+            if provider_icon and not provider_icon.isNull():
+                self._icon_cache[cache_key] = provider_icon
+                return provider_icon
+
             large = wintypes.HICON()
             small = wintypes.HICON()
             extracted = shell32.ExtractIconExW(expanded, index, ctypes.byref(large), ctypes.byref(small), 1)
@@ -656,6 +674,43 @@ class RegistryManager:
                 metadata["company"] = f"{guess} (推測)"
         return metadata
 
+    def diagnose_handler(self, entry: HandlerEntry) -> Dict[str, str]:
+        """Return evidence explaining where a handler belongs and whether it works."""
+        metadata = self.resolve_handler_metadata(entry)
+        target = metadata.get("path") or entry.target_path or ""
+        target_exists = bool(target and Path(target).is_file())
+        if entry.type == "shellex":
+            clsid_path = f"HKEY_CLASSES_ROOT\\CLSID\\{entry.clsid}" if entry.clsid else ""
+            server = self._clsid_server_path(entry.clsid)
+            registration = bool(entry.clsid and _registry_key_exists(clsid_path))
+            evidence = server or "InprocServer32が見つかりません"
+            kind = "ShellEx（DLL拡張）"
+        else:
+            clsid_path = ""
+            registration = True
+            evidence = entry.command or "commandが見つかりません"
+            kind = "通常メニュー（shell）"
+        if entry.is_broken:
+            appearance = "表示されない可能性があります"
+        elif entry.enabled:
+            appearance = "表示候補です（対象によって表示条件が変わります）"
+        else:
+            appearance = "現在は無効化されているため表示されません"
+        return {
+            "name": entry.name,
+            "scope": entry.scope,
+            "kind": kind,
+            "enabled": "有効" if entry.enabled else "無効",
+            "appearance": appearance,
+            "registry_path": entry.full_key_path,
+            "clsid": entry.clsid or "なし",
+            "clsid_path": clsid_path or "なし",
+            "registration": "登録あり" if registration else "登録なし",
+            "target": target or evidence,
+            "target_exists": "存在します" if target_exists else "存在しません／確認できません",
+            "reason": entry.broken_reason or "問題は検出されていません",
+        }
+
 
     def _slugify_handler_name(self, value: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "-", value.lower())
@@ -827,6 +882,114 @@ class RegistryManager:
         }
         entry.registry_path = dest_rel
         return dest_rel
+
+    # ------------------------------------------------------------------ #
+    # Registry tree and backup helpers
+    # ------------------------------------------------------------------ #
+    def _copy_tree(self, source_path: str, destination_path: str):
+        try:
+            with winreg.OpenKey(HKCR, source_path, 0, READ_FLAGS) as src_key:
+                dest_key = winreg.CreateKeyEx(HKCR, destination_path, 0, WRITE_FLAGS)
+                try:
+                    self._copy_values(src_key, dest_key)
+                    index = 0
+                    while True:
+                        try:
+                            child_name = winreg.EnumKey(src_key, index)
+                        except OSError:
+                            break
+                        index += 1
+                        self._copy_tree(
+                            f"{source_path}\\{child_name}",
+                            f"{destination_path}\\{child_name}",
+                        )
+                finally:
+                    dest_key.Close()
+        except FileNotFoundError as exc:
+            raise RegistryOperationError(f"Source key not found: {source_path}") from exc
+
+    def _copy_values(self, src_key, dest_key):
+        index = 0
+        while True:
+            try:
+                name, value, value_type = winreg.EnumValue(src_key, index)
+            except OSError:
+                break
+            index += 1
+            winreg.SetValueEx(dest_key, name, 0, value_type, value)
+
+    def _delete_tree(self, path: str):
+        try:
+            with winreg.OpenKey(HKCR, path, 0, WRITE_FLAGS) as key:
+                children = []
+                index = 0
+                while True:
+                    try:
+                        children.append(winreg.EnumKey(key, index))
+                    except OSError:
+                        break
+                    index += 1
+        except FileNotFoundError:
+            return
+        for child in children:
+            self._delete_tree(f"{path}\\{child}")
+        winreg.DeleteKey(HKCR, path)
+
+    def export_to_reg(self, entries: Iterable[HandlerEntry], destination: Path) -> int:
+        paths = []
+        seen = set()
+        for entry in entries:
+            if entry.registry_path not in seen:
+                seen.add(entry.registry_path)
+                paths.append(entry.registry_path)
+        if not paths:
+            return 0
+        lines = [REG_HEADER, ""]
+        for path in paths:
+            lines.append(f"[HKEY_CLASSES_ROOT\\{path}]")
+            lines.extend(self._dump_values(path))
+            lines.append("")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("\n".join(lines), encoding="utf-16le")
+        return len(paths)
+
+    def _dump_values(self, path: str) -> List[str]:
+        try:
+            with winreg.OpenKey(HKCR, path, 0, READ_FLAGS) as key:
+                rows = []
+                index = 0
+                while True:
+                    try:
+                        name, value, value_type = winreg.EnumValue(key, index)
+                    except OSError:
+                        break
+                    index += 1
+                    rows.append(self._format_reg_value(name, value, value_type))
+                return rows
+        except FileNotFoundError:
+            return []
+
+    def _format_reg_value(self, name: Optional[str], value, value_type: int) -> str:
+        target_name = "@" if name in (None, "") else f'"{name}"'
+        if value_type in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+            escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+            return f'{target_name}="{escaped}"'
+        if value_type == winreg.REG_DWORD:
+            return f"{target_name}=dword:{int(value):08x}"
+        if value_type == winreg.REG_BINARY:
+            return f"{target_name}=hex:{','.join(f'{byte:02x}' for byte in value)}"
+        return f'{target_name}="{str(value)}"'
+
+    def export_to_csv(self, entries: Iterable[HandlerEntry], destination: Path) -> int:
+        rows = [entry.to_csv_row() for entry in entries]
+        if not rows:
+            return 0
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["名前", "スコープ", "状態", "レジストリパス", "最終変更日時"])
+            writer.writerows(rows)
+        return len(rows)
 
 
 @dataclass
